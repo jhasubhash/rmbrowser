@@ -42,7 +42,31 @@ and presents through Qt6 + the vendor `epaper` QPA with xochitl (the stock UI) s
 
 ## Build
 
-Requires Docker with linux/arm64 (Apple Silicon is native). See `toolchain/README.md`.
+Requires Docker with linux/arm64 (Apple Silicon is native) and the `rmweb-sdk` image. See
+`toolchain/README.md`.
+
+### Fast path: app only, minutes (use this for anything in `engine/wpeqt/`)
+
+```sh
+./scripts/fetch-sdk.sh && docker build -f toolchain/Dockerfile -t rmweb-sdk .   # once
+./scripts/fast-build.sh all       # sdk (once) + app + package → dist/rmweb-<VERSION>.tar.gz
+RMWEB_TARBALL=dist/rmweb-$(cat VERSION).tar.gz ./scripts/setup-device.sh rmweb  # install
+```
+
+- `fast-build.sh sdk` runs `engine/gen-app-sdk.incontainer.sh` in `debian:trixie`. It generates
+  WPE WebKit 2.48.5's public headers (`wpe/`, `jsc/`, `wpe-platform/` + headless) from the
+  checksum-pinned source tarball, using WebKit's own `generate-api-header.py` and `glib-mkenums`
+  rules. libwpe, libsoup and xkbcommon headers come from Debian. Output: `build/appsdk/usr`.
+- `fast-build.sh app` compiles `engine/wpeqt` in `rmweb-sdk` against those headers and links
+  against the **prebuilt runtime from the upstream release tarball** (`build/release/`, default
+  `BASE_VER=0.9.7`).
+- `fast-build.sh package` = release runtime + our `rmweb-wpeqt` + `device/*` + Readability +
+  `VERSION`.
+- Limits: the engine itself (WPE, Mesa, soup) is **not** rebuilt. Engine changes or a WPE version
+  bump need the full build below. Keep `VERSION` unique per build you install, so the tablet's
+  `rmweb.log` shows which one ran.
+
+### Full build (engine + app; hours, tens of GB)
 
 ```sh
 ./scripts/fetch-sdk.sh                                  # ~467 MB ferrari SDK installer (gitignored)
@@ -56,9 +80,6 @@ docker build -f toolchain/Dockerfile -t rmweb-sdk .     # SDK image (/opt/rmpp-s
 - `build-wpeqt.sh` links against `build/stage/usr` and `build/stage-mesa/usr`, the WPE/Mesa
   install prefixes produced by `build-wpe.sh`. Both are gitignored, so a fresh clone needs the
   multi-hour engine build once.
-- **Faster path, not yet implemented:** WPE stays 2.48.5 and the runtime `.so` files ship in the
-  release tarball, so we could seed a stage dir from the release `lib/` plus WPE 2.48.5 headers and
-  rebuild only `rmweb-wpeqt`. If you build this, document it here.
 - `package.sh` refuses to package if `engine/wpeqt` sources are newer than the binary.
 
 ## Deploy & test on the device
@@ -91,7 +112,13 @@ at the panel.
   presents.
 - **xochitl restart limit:** `StartLimitBurst=4` per 10 min + `OnFailure=emergency.target`, so
   rapid stop/start cycles reboot the tablet. Space out test launches and use
-  `systemctl reset-failed xochitl`. Never leave xochitl stopped: wrap test scripts in
+  `systemctl reset-failed xochitl`.
+- **Never stop xochitl while it's still starting.** Verified 2026-10-13: launching rmweb 13 s after
+  xochitl (re)started made xochitl SEGV on stop, and `OnFailure` triggered an emergency reboot.
+  Before each test launch, poll until `systemctl is-active xochitl` and the xochitl process is
+  ≥ 15 s old (`/proc/<pid>/stat` field 22 vs `/proc/uptime`). Don't use a fixed sleep.
+- **Debug env survives a relaunch.** After an exit-75 orientation restart, the relaunched app
+  inherits `RMWEB_DEBUG_UITAP*`/`RMWEB_GRAB_MS` and replays them in the new orientation. Never leave xochitl stopped: wrap test scripts in
   `trap "systemctl start xochitl" EXIT HUP INT TERM`.
 - **Never `kill -9` the launcher** (`/home/root/rmweb/rmweb`). Its trap is what restores xochitl.
 - **JIT is broken** on this toolchain; the JS interpreter is the default. Heavy SPAs are out of
@@ -103,15 +130,25 @@ at the panel.
 
 ## Roadmap (fork)
 
-1. **Landscape mode** (next). Today everything assumes portrait: the web viewport is the panel size
-   from `primaryScreen()->size()` (1620×2160, logical 810×1080 at DPR 2); `TouchReader` maps raw →
-   panel without rotation; chrome zones (`barZone`/`kbZone`/…) and `keyboard.h` are portrait
-   layouts. Plan: a rotation setting (0/90/270, later following the orientation sensor). Size the
-   WPE view to the rotated logical size, rotate the frame in `WpeView::paint` (or the canvas)
-   before present, rotate touch coordinates in `TouchReader`, and reflow the chrome and keyboard
-   for the wide aspect. Keep present-gate semantics unchanged, and verify with `RMWEB_GRAB_MS`
-   grabs plus real taps.
-2. The fast app-only build path described under Build.
+1. ✅ **Landscape mode** (0.9.7-fork.1, device-verified 2026-10-13 on OS 3.28.0.172).
+   - Settings → Display → Screen orientation cycles portrait → landscape (90) → landscape flipped
+     (270). It's persisted as `rotate=` in `settings.txt`; `RMWEB_ROTATE=0|90|270` overrides it
+     per run.
+   - Orientation is fixed per process. `kPanelW/H` becomes the logical 2160×1620 frame, so the
+     engine viewport (1080×810 CSS), chrome, keyboard and hit-tests need no orientation-specific
+     code.
+   - Only three things rotate: `WpeView::paint` (painter transform for chrome; the page image is
+     pre-rotated with `QImage::transformed`, Qt's exact 90° path), damage rects
+     (`logicalRectToPhys` before `update()` / `presentFast`), and `TouchReader` (physical → logical
+     at `SYN_REPORT`). Full-panel swaps use `kPhysW/H`. The maths lives in `rotate.h`
+     (`tests/rotate_test.cpp`).
+   - Changing orientation exits with code 75 (`kExitRestart`) after a drain and flush.
+     `device/rmweb` relaunches without restoring xochitl (bounded to 5; `tests/launcher_test.sh`
+     cases 11–12).
+   - Not yet verified: a real finger on the rotated glass. Synthetic taps go through the router
+     *after* the mapping, so `physToLogical` on device is covered only by the unit test.
+2. **Follow the tablet's orientation automatically**: read xochitl's own orientation or the
+   accelerometer instead of the manual setting.
 3. Merge upstream releases: `git fetch upstream && git merge upstream/master`.
 
 ## Working agreement

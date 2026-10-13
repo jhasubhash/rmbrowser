@@ -77,6 +77,9 @@ int main() {
     Settings sar; sar.autoRefreshSec = -1;
     CHECK(has(buildSettingsPage(sar), "blocked (never)")); // auto-refresh cycle label
     CHECK(has(sp, "rmweb:home"));                         // back link to the start page
+    CHECK(has(sp, "rmweb:rotate-next") && has(sp, "portrait"));   // orientation row, default portrait
+    Settings srot; srot.rotate = 270;
+    CHECK(has(buildSettingsPage(srot), "landscape (flipped)"));
 
     // address-bar search: case-insensitive substring on title/url, results page renders matches
     CHECK(containsCI("E-Reader Wiki", "reader"));

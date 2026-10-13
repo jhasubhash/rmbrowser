@@ -226,6 +226,11 @@ int main() {
         CHECK(detail::atomicWrite(dir + "/settings.txt", "autoRefreshSec=" + std::to_string(v) + "\n"));
         CHECK(loadSettings(dir).autoRefreshSec == v);             // valid set members kept as-is
     }
+    // rotate: round-trips 90/270, defaults to portrait, snaps anything else to 0
+    CHECK(loadSettings(dir).rotate == 0);
+    { Settings sr; sr.rotate = 270; CHECK(saveSettings(dir, sr)); CHECK(loadSettings(dir).rotate == 270); }
+    CHECK(detail::atomicWrite(dir + "/settings.txt", "rotate=180\n"));
+    CHECK(loadSettings(dir).rotate == 0);
 
     // Duplicate URLs in the store (hand-edited file): loadBookmarks keeps both — no dedupe on
     // load — and toggleBookmark removes only the FIRST match. Current behavior, pinned here.

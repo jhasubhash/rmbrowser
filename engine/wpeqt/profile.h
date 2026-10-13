@@ -27,6 +27,8 @@ struct Settings { double zoom = 0.5; int readerFont = 30; std::string ua; bool r
                                             // (the QPA auto waveform underdrives black on fast presents)
                   int autoRefreshSec = 15;  // >0: min seconds between same-URL auto-navigations;
                                             // 0: guard off (allow all); -1: block all auto-refreshes
+                  int rotate = 0;           // screen orientation: 0 portrait, 90 landscape,
+                                            // 270 landscape (flipped) — rotate.h; read at startup
                 };
 struct ScrollEntry { std::string url; int pos = 0; };   // per-URL reading position (page offset, CSS px)
 struct Tab { std::string url, title; };                 // tabs-lite: one entry per open page, MRU first
@@ -311,7 +313,9 @@ inline Settings loadSettings(const std::string& dir) {
         else if (k == "textBoost") s.textBoost = (v != "0");   // default ON: absent/corrupt stays true
         else if (k == "settleFlash") s.settleFlash = (v != "0");   // default ON: same rule
         else if (k == "autoRefreshSec") s.autoRefreshSec = std::atoi(v.c_str());
+        else if (k == "rotate") s.rotate = std::atoi(v.c_str());
     }
+    if (s.rotate != 90 && s.rotate != 270) s.rotate = 0;                   // portrait unless a valid landscape
     if (!(s.zoom >= 0.5 && s.zoom <= 3.0)) s.zoom = 0.5;                 // clamp corrupt values (0.5 = the default)
     if (!(s.readerFont >= 14 && s.readerFont <= 96)) s.readerFont = 30;
     // autoRefreshSec has a fixed valid set (the settings page cycles through it); snap anything else.
@@ -332,7 +336,8 @@ inline bool saveSettings(const std::string& dir, const Settings& s) {
                     + "bwFast=" + std::string(s.bwFast ? "1" : "0") + "\n"
                     + "textBoost=" + std::string(s.textBoost ? "1" : "0") + "\n"
                     + "settleFlash=" + std::string(s.settleFlash ? "1" : "0") + "\n"
-                    + "autoRefreshSec=" + std::to_string(s.autoRefreshSec) + "\n";
+                    + "autoRefreshSec=" + std::to_string(s.autoRefreshSec) + "\n"
+                    + "rotate=" + std::to_string(s.rotate) + "\n";
     return detail::atomicWrite(dir + "/settings.txt", out);
 }
 

@@ -63,6 +63,9 @@ What `all` does, in order:
 - Connect to Wi-Fi in the normal reMarkable settings.
 - Open AppLoad from the sidebar, then tap **rmweb**. The browser stops xochitl and takes the panel.
 - Tap **⏻** twice to quit. xochitl comes back with xovi.
+- **Landscape** (this fork): start page → Open settings → Display → *Screen orientation* cycles
+  portrait → landscape (right edge on top) → landscape flipped (left edge on top). The browser
+  restarts into the new orientation within a couple of seconds and remembers it.
 - **After a reboot** xovi is off (it's tethered by design). Triple-press the power button to bring
   AppLoad back.
 
@@ -96,7 +99,8 @@ Useful launch env (pass with `systemd-run --setenv=K=V`):
 | Screen blanks and you're back at the lock screen; log ends `[watchdog] GUI loop silent >12 s … rc=63` | Vendor e-ink present hang. On OS 3.27.x (`abi=legacy`) it happens every time: update to 3.28+. |
 | xochitl keeps restarting after `xovi/start` | AppLoad doesn't match the OS, or the hashtable is stale. `ssh root@10.11.99.1 /home/root/xovi/stock`, then fix AppLoad and rebuild the hashtable. |
 | New SSH logins reset at key exchange | tripletap's `enable.sh` took the host key mount down. Reboot the tablet, or run the repair block in `setup-device.sh`. |
-| Tablet emergency-reboots during testing | Too many xochitl stop/starts in 10 min (`StartLimitBurst=4`). Space out launches; `systemctl reset-failed xochitl`. |
+| Tablet emergency-reboots during testing | Either too many xochitl stop/starts in 10 min (`StartLimitBurst=4`), or rmweb stopped xochitl while it was still starting (it SEGVs, then `OnFailure` reboots). Before each launch, wait until xochitl has been active for ≥ 15 s; `systemctl reset-failed xochitl`. |
+| AppLoad icon gone after a reboot | xovi is tethered: triple-press power (or `ssh root@10.11.99.1 /home/root/xovi/start`). |
 | `head: invalid option -- '2'` | The device shell is BusyBox: use `head -n N`. |
 
 ## 6. Uninstall

@@ -23,6 +23,7 @@
 #include <QQuickWindow>
 #include <QPainter>
 #include <QPainterPath>
+#include <QTransform>
 #include <QPolygonF>
 #include <QElapsedTimer>
 #include <QDir>
@@ -69,6 +70,7 @@
 #include "library.h"   // PDF/EPUB download -> xochitl library import (tests/library_test.cpp)
 #include "startpage.h" // start-page HTML generator
 #include "fieldprobe.h"// tap-probe result protocol + JS string escaping (tests/fieldprobe_test.cpp)
+#include "rotate.h"    // portrait/landscape coordinate maps (tests/rotate_test.cpp)
 #include <ctime>
 using rmweb::Gesture;
 using rmweb::classifyGesture;
@@ -82,6 +84,23 @@ Q_LOGGING_CATEGORY(lcEngine, "rmweb.engine", QtWarningMsg)  // per-frame/tap tra
 // TouchReader::run. Fallbacks = Paper Pro. Everything panel-px below goes through these.
 static int kPanelW = 1620, kPanelH = 2160, kTouchRawW = 2064, kTouchRawH = 2832;
 static int kPhysW = 1620, kPhysH = 2160;   // real QPA panel; kPanel* may be faked (RMWEB_PANEL)
+// Screen orientation (rotate.h): 0 portrait, 90/270 landscape. Fixed for the process lifetime (set in
+// main() before anything sizes itself; an orientation change restarts the app — kExitRestart). In
+// landscape kPanelW/H is the LOGICAL frame (2160x1620): the engine viewport, chrome, keyboard and
+// hit-tests all work in it, and only paint (WpeView), damage rects and touch (TouchReader) rotate.
+static int kRotate = 0;
+static const int kExitRestart = 75;        // exit code: device/rmweb relaunches the app (EX_TEMPFAIL)
+// Logical -> physical painter transform (identity in portrait). Matches rotate.h and
+// QImage::transformed(QTransform().rotate(kRotate)).
+static QTransform logicalToPhysTransform() {
+    if (kRotate == 90)  return QTransform(0, 1, -1, 0, kPhysW, 0);    // (x,y) -> (PW - y, x)
+    if (kRotate == 270) return QTransform(0, -1, 1, 0, 0, kPhysH);    // (x,y) -> (y, PH - x)
+    return QTransform();
+}
+static QRect logicalRectToPhys(const QRect &r) {
+    const rmweb::IRect p = rmweb::logicalRectToPhys(kRotate, kPhysW, kPhysH, {r.x(), r.y(), r.width(), r.height()});
+    return QRect(p.x, p.y, p.w, p.h);
+}
 // (swipe/tap thresholds live in gesture.h GestureParams — single source of truth; the page-turn
 //  step itself is innerHeight*0.92, computed in the pageBy JS — callers pass only a direction)
 
@@ -309,6 +328,7 @@ Q_SIGNALS:
     void bookmarkedChanged(bool on);               // current page bookmark state changed
     void notice(const QString &text);              // transient toast in the chrome (find results, downloads)
     void ghostClearRequested();                    // settings-page "Clear ghosting now" -> view does a full develop
+    void restartRequested();                       // settings-page orientation change -> clean exit(kExitRestart)
     void fieldFocused(const QString &value, bool masked, const QString &suggest); // a text field was tapped -> open the keyboard (suggest = autofill prefill for an empty field, may be empty)
     void tlsStateChanged(int state);                 // 0 = http/none, 1 = https ok, 2 = https with cert errors
     void readProgressChanged(double frac);           // reading position 0..1 of the scrollable page; -1 = hide (page doesn't scroll)
@@ -552,6 +572,17 @@ public Q_SLOTS:
                         rmweb::saveSettings(self->m_profileDir, self->m_settings);
                         qInfo("[form] autofill memory cleared (settings)");
                         done();
+                    } else if (cmd == "rotate-next") {
+                        // Orientation is fixed per process (the viewport, chrome and keyboard are sized
+                        // at startup), so persist the next one and restart: the GUI drains the panel,
+                        // flushes the profile and exits kExitRestart; device/rmweb relaunches the app
+                        // without bringing xochitl back in between.
+                        self->m_settings.rotate = rmweb::nextRotation(self->m_settings.rotate);
+                        rmweb::saveSettings(self->m_profileDir, self->m_settings);
+                        qInfo("[panel] orientation -> %s (%d), restarting",
+                              rmweb::rotationLabel(self->m_settings.rotate), self->m_settings.rotate);
+                        Q_EMIT self->notice(QStringLiteral("Rotating screen…"));
+                        Q_EMIT self->restartRequested();
                     } else if (cmd == "clear-ghosting") {
                         // Panel maintenance, not a setting: the view (GUI thread) owns m_epd — ask it
                         // for one full-quality develop. Honoured only from our pages (guard above).
@@ -2269,7 +2300,22 @@ public:
         g_usleep((guint)m_dwellMs * 1000 + 300000);   // dwell + physical tail margin
     }
     void paint(QPainter *p) override {
-        const qreal w = width(), h = height();
+        // Everything below works in the LOGICAL frame (kPanelW x kPanelH; equals the item size in
+        // portrait). In landscape the painter maps logical -> physical, so the chrome/keyboard/badge
+        // painters are orientation-agnostic and clipBoundingRect() (the tone passes' row range) comes
+        // back in logical coordinates; the page image itself goes through drawContent's pre-rotation.
+        const qreal w = kPanelW, h = kPanelH;
+        const QTransform base = p->transform();
+        if (kRotate) p->setTransform(logicalToPhysTransform(), true);
+        auto drawContent = [&](const QImage &img) {
+            if (!kRotate) { p->drawImage(QRectF(0, 0, w, h), img); return; }
+            // Rotate the frame with QImage's exact 90° path (a memrotate, no resampling) and blit it
+            // untransformed: a rotated drawImage would resample 3.5 MP through the raster engine.
+            p->save();
+            p->setTransform(base);
+            p->drawImage(QPointF(0, 0), img.transformed(QTransform().rotate(kRotate)));
+            p->restore();
+        };
         if (!m_img.isNull()) {
             if (m_bwFast) {
                 if (m_grayDirty) {                          // convert once per new frame / toggle
@@ -2298,7 +2344,7 @@ public:
                     }
                     if (y0 <= 0 && y1 >= rows - 1) m_grayDirty = false;   // full-height paint = complete cache
                 }
-                p->drawImage(QRectF(0, 0, w, h), m_imgGray);
+                drawContent(m_imgGray);
             } else if (m_textBoost) {
                 if (m_tonedDirty) {                         // re-tone once per new frame / toggle
                     // Colour-mode text darkening: scale each pixel by the ctor-built LUT over its
@@ -2328,9 +2374,9 @@ public:
                     }
                     if (y0 <= 0 && y1 >= rows - 1) m_tonedDirty = false;   // full-height paint = complete cache
                 }
-                p->drawImage(QRectF(0, 0, w, h), m_imgToned);
+                drawContent(m_imgToned);
             } else {
-                p->drawImage(QRectF(0, 0, w, h), m_img);
+                drawContent(m_img);
             }
         }
         else                 p->fillRect(QRectF(0, 0, w, h), Qt::white);
@@ -2358,7 +2404,7 @@ public:
     struct ChromeX { int powerX, readerX, starX, zInX, zOutX; };
     ChromeX chromeLayout() const {
         ChromeX c;
-        c.powerX  = int(width()) - kPowerW();         // right: A- | A+ | ★ | Reader | Power
+        c.powerX  = kPanelW - kPowerW();              // right: A- | A+ | ★ | Reader | Power (logical px)
         c.readerX = c.powerX - kReaderW();
         c.starX   = c.readerX - kStarW();
         c.zInX    = c.starX - kZoomW();
@@ -3122,12 +3168,14 @@ private:
         const QRect dirty = alignOut8(m_dirtyAccum);
         m_dirtyAccum = QRect();
         if (regional && dirty != QRect(0, 0, kPanelW, kPanelH)) {
-            m_lastPresentRect = dirty;
-            qCDebug(lcEngine, "[t][gui] present dirty=%dx%d@%d,%d", dirty.width(), dirty.height(),
-                    dirty.x(), dirty.y());
-            update(dirty);                       // -> scene render of the region -> EPRenderLoop
+            // dirty is LOGICAL; the item, the QPA damage and presentFast's swap rect are PHYSICAL.
+            const QRect phys = logicalRectToPhys(dirty);
+            m_lastPresentRect = phys;
+            qCDebug(lcEngine, "[t][gui] present dirty=%dx%d@%d,%d", phys.width(), phys.height(),
+                    phys.x(), phys.y());
+            update(phys);                        // -> scene render of the region -> EPRenderLoop
         } else {                                 // pushes exactly it to the panel
-            m_lastPresentRect = QRect(0, 0, kPanelW, kPanelH);
+            m_lastPresentRect = QRect(0, 0, kPhysW, kPhysH);
             update();                            // -> scene render -> EPRenderLoop present to panel
         }
         m_fallback.start(kFallbackMs);
@@ -3286,6 +3334,7 @@ public Q_SLOTS:
         // the PREVIOUS frame's stale x/y. Flag down/lift instead and resolve at SYN_REPORT, where x/y are
         // coherent for the whole frame.
         int curSlot = 0, x = 0, y = 0, sx = 0, sy = 0;
+        int px = 0, py = 0;   // latest PHYSICAL panel position; x/y = its logical (rotated) mapping
         bool down = false, pendingDown = false, pendingLift = false;
         gint64 downUs = 0;   // contact-start time, for tap dwell
         struct input_event ev[64];
@@ -3297,6 +3346,14 @@ public Q_SLOTS:
             for (size_t i = 0; i < n / sizeof(struct input_event); ++i) {
                 const struct input_event &p = ev[i];
                 if (p.type == EV_SYN && p.code == SYN_REPORT) {
+                    // One coherent frame: map the physical point into the logical (maybe rotated)
+                    // frame here, so swipe deltas below follow the on-screen orientation.
+                    if (kRotate) {
+                        rmweb::physToLogical(kRotate, kPhysW, kPhysH, px, py, x, y);
+                    } else {   // portrait: clamp into the (maybe RMWEB_PANEL-faked) viewport
+                        x = std::min(px, kPanelW - 1);
+                        y = std::min(py, kPanelH - 1);
+                    }
                     if (pendingDown) { down = true; sx = x; sy = y; downUs = g_get_monotonic_time(); pendingDown = false; }
                     if (pendingLift) { if (down) emitGesture(x - sx, y - sy, x, y, downUs); down = false; pendingLift = false; }
                     continue;
@@ -3304,10 +3361,10 @@ public Q_SLOTS:
                 if (p.type != EV_ABS) continue;
                 if (p.code == ABS_MT_SLOT) { curSlot = p.value; continue; }
                 if (curSlot != 0) continue;                                  // first finger only
-                // Map raw to the REAL panel (kPhys*), then clamp into the (maybe faked) viewport:
-                // under RMWEB_PANEL the UI sits 1:1 in the top-left, so taps hit what they touch.
-                if (p.code == ABS_MT_POSITION_X)      x = std::min(p.value * kPhysW / kTouchRawW, kPanelW - 1);
-                else if (p.code == ABS_MT_POSITION_Y) y = std::min(p.value * kPhysH / kTouchRawH, kPanelH - 1);
+                // Map raw to the REAL panel (kPhys*); the logical mapping happens at SYN_REPORT
+                // (rotation needs both axes; under RMWEB_PANEL the UI sits 1:1 in the top-left).
+                if (p.code == ABS_MT_POSITION_X)      px = std::min(p.value * kPhysW / kTouchRawW, kPhysW - 1);
+                else if (p.code == ABS_MT_POSITION_Y) py = std::min(p.value * kPhysH / kTouchRawH, kPhysH - 1);
                 else if (p.code == ABS_MT_TRACKING_ID) {
                     if (p.value >= 0) pendingDown = true;                     // new contact -> latch pos at SYN
                     else              pendingLift = true;                     // -1 -> lifted -> emit at SYN
@@ -3459,12 +3516,12 @@ public:
         const bool isFull = (m_fullEvery > 0 && (m_frames % m_fullEvery) == 0);
         qCDebug(lcEngine, "[present] #%d swap enter full=%d", m_frames, isFull);
         if (isFull) fullSwap();                                     // full quality + anti-ghost flash (develops colour)
-        else        swap(QRect(0, 0, kPanelW, kPanelH), 0, 1, 0);   // Mono, fast, no flash
+        else        swap(QRect(0, 0, kPhysW, kPhysH), 0, 1, 0);   // Mono, fast, no flash (physical panel)
         qCDebug(lcEngine, "[present] #%d swap done", m_frames);
     }
     // One full-quality flash: develops colour and clears accumulated ghosting. Shared by present()'s
     // colour cadence and presentFast()'s anti-ghost cadence. public for the RMWEB_FULL_PRESENT diagnostic.
-    void fullSwap() { swap(QRect(0, 0, kPanelW, kPanelH), 1, 4, 1); }   // Color, QualityFull, CompleteRefresh
+    void fullSwap() { swap(QRect(0, 0, kPhysW, kPhysH), 1, 4, 1); }   // Color, QualityFull, CompleteRefresh
 private:
     // swap dispatch: current ABI (QRect, mode, flags) vs legacy (QRect, contentType, mode, flags).
     // The legacy ABI takes the content type — pass it through (a full flash is Color, not Mono).
@@ -3562,7 +3619,24 @@ int main(int argc, char **argv) {
             qWarning("[panel] ignoring malformed RMWEB_PANEL='%s' (want WxH)", gp);
         }
     }
-    qInfo("[panel] %dx%d", kPanelW, kPanelH);   // touch raw range is logged by TouchReader (EVIOCGABS)
+    // Orientation: the persisted setting (settings page), overridable per run with RMWEB_ROTATE
+    // (0/90/270 or portrait/landscape/landscape-flipped). Read here — before the engine sizes its
+    // viewport from kPanelW/H — straight from the profile (the engine loads it again on its thread).
+    {
+        const char *pd = getenv("RMWEB_PROFILE");
+        kRotate = rmweb::loadSettings((pd && *pd) ? pd : "/home/root/.rmweb").rotate;
+        if (const char *rv = getenv("RMWEB_ROTATE"); rv && *rv) {
+            const int r = rmweb::parseRotation(rv);
+            if (r >= 0) kRotate = r;
+            else qWarning("[panel] ignoring malformed RMWEB_ROTATE='%s' (want 0|90|270)", rv);
+        }
+        if (kRotate && qEnvironmentVariableIsSet("RMWEB_PANEL")) {
+            qWarning("[panel] RMWEB_PANEL dry-run is portrait-only — ignoring rotation");
+            kRotate = 0;
+        }
+        if (kRotate) rmweb::logicalSize(kRotate, kPhysW, kPhysH, kPanelW, kPanelH);
+    }
+    qInfo("[panel] %dx%d rotate=%d (physical %dx%d)", kPanelW, kPanelH, kRotate, kPhysW, kPhysH);   // touch raw range is logged by TouchReader (EVIOCGABS)
     const QString url      = (argc > 1) ? QString::fromUtf8(argv[1]) : QString();
     const QString savePath = (argc > 2) ? QString::fromUtf8(argv[2]) : QString();
 
@@ -3698,6 +3772,16 @@ int main(int argc, char **argv) {
         QObject::connect(&engine, &WpeEngine::notice, view, &WpeView::setNotice, Qt::QueuedConnection);
         QObject::connect(&engine, &WpeEngine::ghostClearRequested, view, &WpeView::clearGhosting,
                          Qt::QueuedConnection);   // settings-page command (worker) -> GUI thread
+        // Orientation change (settings page): same clean exit as ⏻ — drain the in-flight e-ink
+        // present, flush the profile (the new rotation is already saved) — but exit kExitRestart so
+        // device/rmweb relaunches straight into the new orientation (xochitl stays stopped).
+        QObject::connect(&engine, &WpeEngine::restartRequested, &app, [&engine, view]{
+            if (view->isExiting()) return;
+            qInfo("[exit] restart for orientation change");
+            view->drainForExit();
+            engine.flushSync();
+            std::_Exit(kExitRestart);
+        }, Qt::QueuedConnection);
         // Form fields: a tapped text field opens the keyboard on its current value (or an autofill
         // prefill when the field is empty); Go commits the typed text into the page field (native
         // setter + input/change events) and learns it for future prefills.

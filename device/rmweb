@@ -106,9 +106,29 @@ fi
 . "$R/rmweb-env.sh"
 
 rotate_log   # the app's own append below is the main growth source
-log "launch rmweb-wpeqt $*"
-"$R/bin/rmweb-wpeqt" "$@" >> "$LOG" 2>&1 &
-APP=$!
-wait "$APP"
-log "rmweb-wpeqt exited rc=$?"
+# Exit code 75 (kExitRestart in main.cpp) = "relaunch me" (settings-page orientation change): run the
+# app again WITHOUT restoring xochitl in between — a xochitl stop/start pair per relaunch would burn
+# its StartLimitBurst (4 per 10 min -> emergency reboot). Bounded, so a crash-looping restart can't spin.
+RELAUNCHES=0
+while :; do
+  log "launch rmweb-wpeqt $*"
+  "$R/bin/rmweb-wpeqt" "$@" >> "$LOG" 2>&1 &
+  APP=$!
+  wait "$APP"
+  rc=$?
+  log "rmweb-wpeqt exited rc=$rc"
+  [ "$rc" = 75 ] && [ "$RELAUNCHES" -lt 5 ] || break
+  RELAUNCHES=$((RELAUNCHES+1))
+  # Same hygiene as cleanup(): WPE helpers can outlive the UI process, and the next instance must
+  # not start into a still-held epaper framebuffer.
+  for n in WPEWebProcess WPENetworkProc WPEGPUProcess; do
+    # shellcheck disable=SC2046
+    for p in $(pgrep "$n" 2>/dev/null); do kill -9 "$p" 2>/dev/null; done
+  done
+  i=0; while pgrep rmweb-wpeqt >/dev/null 2>&1 && [ "$i" -lt 10 ]; do sleep 1; i=$((i+1)); done
+  sleep 1
+  rotate_log
+  log "relaunching (orientation change #$RELAUNCHES)"
+done
+APP=
 # EXIT trap -> cleanup -> restores xochitl.

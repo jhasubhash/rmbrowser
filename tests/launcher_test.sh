@@ -20,7 +20,9 @@ setup(){ # fresh device-root + stubs + fake app; $1 = app mode (clean|crash|hang
   make_stub umount 'echo "umount $*" >> "'"$STUBLOG"'"; exit 0'
   make_stub pgrep  'exit 1'
   { echo '#!/bin/sh'; echo 'echo "app $*" >> "'"$STUBLOG"'"';
-    echo 'case "${APP_MODE:-clean}" in clean) exit 0;; crash) exit 1;; hang) sleep 30;; esac'; } > "$R/bin/rmweb-wpeqt"
+    echo 'n=$(cat "'"$R"'/.runs" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "'"$R"'/.runs"';
+    echo 'case "${APP_MODE:-clean}" in clean) exit 0;; crash) exit 1;; hang) sleep 30;;';
+    echo '  restart-once) [ "$n" = 1 ] && exit 75; exit 0;; restart-loop) exit 75;; esac'; } > "$R/bin/rmweb-wpeqt"
   chmod +x "$R/bin/rmweb-wpeqt"
 }
 
@@ -93,6 +95,19 @@ out=$(APP_MODE=clean PATH="$STUBS:$PATH" RMWEB_ROOT="$R" XOCHITL_ACTIVE=1 sh "$L
 [ "$rc" = 0 ] || { echo "  FAIL: expected rc=0, got $rc"; fails=$((fails+1)); }
 echo "$out" | grep -q "stale" || { echo "  FAIL: expected a stale-lock notice"; fails=$((fails+1)); }
 want "systemctl stop xochitl"; want "systemctl start xochitl"
+[ -d "$R/.lock" ] && { echo "  FAIL: lock not released"; fails=$((fails+1)); }
+
+echo "case 11: exit 75 (orientation change) relaunches the app WITHOUT restoring xochitl in between"
+setup; APP_MODE=restart-once PATH="$STUBS:$PATH" RMWEB_ROOT="$R" XOCHITL_ACTIVE=1 sh "$LAUNCHER"
+runs=$(cat "$R/.runs"); [ "$runs" = 2 ] || { echo "  FAIL: expected 2 app runs, got $runs"; fails=$((fails+1)); }
+starts=$(grep -c "systemctl start xochitl" "$STUBLOG"); stops=$(grep -c "systemctl stop xochitl" "$STUBLOG")
+[ "$starts" = 1 ] && [ "$stops" = 1 ] || { echo "  FAIL: expected 1 stop + 1 start, got $stops/$starts"; cat "$STUBLOG"; fails=$((fails+1)); }
+grep -q "relaunching" "$R/rmweb.log" || { echo "  FAIL: no relaunch note in log"; fails=$((fails+1)); }
+
+echo "case 12: a restart loop is bounded and still restores xochitl"
+setup; APP_MODE=restart-loop PATH="$STUBS:$PATH" RMWEB_ROOT="$R" XOCHITL_ACTIVE=1 sh "$LAUNCHER"
+runs=$(cat "$R/.runs"); [ "$runs" = 6 ] || { echo "  FAIL: expected 6 app runs (1 + 5 relaunches), got $runs"; fails=$((fails+1)); }
+want "systemctl start xochitl"
 [ -d "$R/.lock" ] && { echo "  FAIL: lock not released"; fails=$((fails+1)); }
 
 if [ "$fails" = 0 ]; then echo "launcher_test: OK"; else echo "launcher_test: $fails FAIL"; exit 1; fi
