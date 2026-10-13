@@ -230,9 +230,9 @@ inline std::string buildSettingsPage(const Settings& s) {
     h += "<div class='hint'>Colour mode only: pushes pale anti-aliased text toward black (mid-tones of "
          "photos darken a bit too). Off in B&amp;W fast mode (that path boosts on its own).</div>";
     row(icon::zap, "rmweb:toggle-settleflash", "Settle flash (deepen blacks)", onoff[s.settleFlash ? 1 : 0]);
-    h += "<div class='hint'>One full-quality flash after the page goes quiet; deepens blacks that quick "
-         "updates underdrive (also in B&amp;W fast mode, where a page that shifts after loading otherwise "
-         "ends up paler than its first render).</div>";
+    h += "<div class='hint'>Colour mode: one full-quality flash after the page goes quiet; deepens blacks "
+         "that quick updates underdrive. Not used in B&amp;W fast mode, whose single update is already "
+         "deep enough.</div>";
     row(icon::zap, "rmweb:clear-ghosting", "Clear ghosting now", "run");
     row(icon::type, "rmweb:toggle-webfonts", "Web fonts", onoff[s.webFonts ? 1 : 0]);
     h += "<div class='hint'>Off: pages use the tablet's own fonts &mdash; one render instead of a second "

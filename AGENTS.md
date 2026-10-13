@@ -144,8 +144,11 @@ at the panel.
     flashes the whole panel whatever rect it's given.
   - `getAuxFramebuffer()` is NOT exported on 3.28.0.172 (upstream's research predates that), hence
     the interposer instead of painting the back buffer.
-  - Levers: `RMWEB_QPA_FORCE=0` (old double push), `RMWEB_QPA_MODE=<0..5>` (forced EPScreenMode,
-    default 1).
+  - **Default waveform `Quality3` (3), no settle flash in B&W** (fork.8, user A/B 2026-10-13).
+    QualityFast plus a page-area settle develop gave dark text but a visible flash about 1 s after
+    each turn; Quality3 alone gives dark text with no flash.
+  - Levers: `RMWEB_QPA_FORCE=0` (old double push), `RMWEB_QPA_MODE=<0..5>` (forced EPScreenMode;
+    `1` = the fast variant, which also brings back the page-area settle develop).
 - **"Web fonts" setting** (`webFonts=`, default on) is a separate content filter
   (`kNoFontsRules`) that blocks all font loads. It made no difference on the page that motivated
   it; its benefit is unproven.

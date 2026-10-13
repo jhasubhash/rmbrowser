@@ -2473,6 +2473,10 @@ public:
             // itself (late layout shifts re-push every text pixel), leaving the final render paler than
             // the first — one full develop once the page is quiet restores it.
             if (m_editing || !m_epd || !m_settleOn || m_exiting) return;   // no flash while typing / off / exiting
+            // Single-push B&W already presents with a deep waveform (Quality3) — nothing left to develop.
+            // RMWEB_QPA_MODE=1 (fast) brings the page-area settle develop back for that variant.
+            static const bool fastVariant = qEnvironmentVariableIntValue("RMWEB_QPA_MODE") == 1;
+            if (singlePush() && !fastVariant) return;
             if (m_inFlight) { m_settleFlash.start(500); return; }   // present still on the panel — retry
             qCDebug(lcEngine, "[t][gui] settle flash (%s)", singlePush() ? "page area" : "full develop");
             manualFullSwap(singlePush() ? logicalRectToPhys(pageArea()) : QRect());
@@ -2913,8 +2917,10 @@ public Q_SLOTS:
         // Single-push B&W: every QPA present goes out with the fast mono waveform (QualityFast=1) via
         // the swapBuffers interposer. RMWEB_QPA_FORCE=0 falls back to the old double push.
         static const bool force = qgetenv("RMWEB_QPA_FORCE") != "0";
+        // Quality3 (3) by default: a deeper, still non-flashing waveform — text comes out dark in ONE
+        // update, so no settle flash is needed (user-verified A/B 2026-10-13 vs QualityFast + settle).
         static const int mode = qEnvironmentVariableIsSet("RMWEB_QPA_MODE")
-                                    ? qBound(0, qEnvironmentVariableIntValue("RMWEB_QPA_MODE"), 5) : 1;
+                                    ? qBound(0, qEnvironmentVariableIntValue("RMWEB_QPA_MODE"), 5) : 3;
         qpa::setForceMode(v && force ? mode : -1);
         markDirtyAll(); schedule();
     }
