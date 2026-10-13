@@ -1,5 +1,10 @@
 # rmweb
 
+> **Fork note:** this is a personal fork of [exp78/rmweb](https://github.com/exp78/rmweb), starting
+> at v0.9.7. For a tested install/recovery runbook see [`docs/paper-pro-setup.md`](docs/paper-pro-setup.md)
+> and `./scripts/setup-device.sh`. Agent and contributor guide: [`AGENTS.md`](AGENTS.md).
+> **Requires reMarkable OS ≥ 3.28 and AppLoad ≥ v0.6.0.**
+
 A native **WPE WebKit** web browser for the **reMarkable Paper Pro** e-ink tablet.
 
 Compatibility: reMarkable Paper Pro (verified on-device); reMarkable Paper Pro Move (untested -
