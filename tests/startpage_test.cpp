@@ -80,6 +80,7 @@ int main() {
     CHECK(has(sp, "rmweb:rotate-next") && has(sp, "auto (follows the tablet)"));   // orientation row, default auto
     Settings srot; srot.rotate = 270;
     CHECK(has(buildSettingsPage(srot), "landscape (flipped)"));
+    CHECK(has(sp, "rmweb:toggle-webfonts"));                       // web fonts row
 
     // address-bar search: case-insensitive substring on title/url, results page renders matches
     CHECK(containsCI("E-Reader Wiki", "reader"));

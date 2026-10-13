@@ -247,6 +247,15 @@ static const char *kBlockRules =
        "\"ins.adsbygoogle,.adsbygoogle,div[id^='div-gpt-ad'],div[data-ad],.ad-slot,.adslot,"
        "iframe[id^='google_ads'],div[id^='yandex_rtb'],div[id^='adfox_'],.js-ad-slot,.advertising\"}}]";
 
+// "Web fonts: off" (settings page): block EVERY downloadable font, first-party too (kBlockRules only
+// drops third-party ones). On e-ink a web font costs a second full repaint ~1-2 s after load when it
+// swaps in (font-display: swap), and the typical thin web font reads paler than the device's own
+// fonts — device log 2026-10-13: a Next.js blog's swap halved the dark samples (nw 186 -> 90). Off =
+// one render, darker text; icon fonts degrade to their fallback glyphs. A separate filter from
+// kBlockRules, so the two toggles stay independent.
+static const char *kNoFontsRules =
+    "[{\"trigger\":{\"url-filter\":\".*\",\"resource-type\":[\"font\"]},\"action\":{\"type\":\"block\"}}]";
+
 // Optional mobile User-Agent (opt-in via RMWEB_UA=mobile): makes heavy JS-app sites (e.g. a heavy SPA news site) serve their
 // lighter MOBILE layout, which renders where the desktop one stays blank. NOT the default — a mobile UA makes
 // server-rendered content sites (Wikipedia & co.) serve a JS-only mobile skin that paints blank on this CPU
@@ -618,6 +627,9 @@ public Q_SLOTS:
                     } else if (cmd == "toggle-block") {
                         self->toggleBlockSetting();
                         done();
+                    } else if (cmd == "toggle-webfonts") {
+                        self->toggleWebFontsSetting();
+                        done();
                     } else if (cmd == "toggle-sitecss") {
                         self->toggleSiteCssSetting();
                         done();
@@ -825,13 +837,13 @@ public Q_SLOTS:
         // add it, THEN load — so it applies to the very first resource loads. The compile is async;
         // loadInitial() runs from its callback. Off => load immediately. A compile failure still loads
         // (unfiltered) so the page works.
-        if (m_settings.block && qgetenv("RMWEB_BLOCK") != "0") {
-            WebKitUserContentFilterStore *store = webkit_user_content_filter_store_new("/home/root/rmweb/cfstore");
-            GBytes *src = g_bytes_new_static(kBlockRules, strlen(kBlockRules));
-            webkit_user_content_filter_store_save(store, "rmweb-block", src, m_cancel, &WpeEngine::onFilterSaved, this);
-            g_bytes_unref(src);
+        // Web fonts off: compile + add the no-fonts filter FIRST (its callback continues with the block
+        // filter), so even the first page renders with device fonts.
+        if (!m_settings.webFonts) {
+            m_fontFilterStartup = true;
+            compileFontFilter();
         } else {
-            loadInitial();
+            startBlockFilter();
         }
 
         g_main_loop_run(m_loop);  // pumps WPE on this thread until stop()
@@ -845,6 +857,7 @@ public Q_SLOTS:
         if (m_view) { g_object_unref(m_view); m_view = nullptr; }
         if (m_ucm)  { g_object_unref(m_ucm);  m_ucm  = nullptr; }
         if (m_blockFilter) { webkit_user_content_filter_unref(m_blockFilter); m_blockFilter = nullptr; }
+        if (m_fontFilter)  { webkit_user_content_filter_unref(m_fontFilter);  m_fontFilter  = nullptr; }
         g_main_context_pop_thread_default(m_ctx);
     }
 
@@ -963,6 +976,55 @@ public Q_SLOTS:
             m_siteCssOn = false;
             qInfo("[sitecss] off (settings)");
         }
+    }
+    // Startup tail of the filter chain: the ad/tracker filter (async compile -> onFilterSaved ->
+    // loadInitial), or straight to the first load when blocking is off.
+    void startBlockFilter() {
+        if (m_settings.block && qgetenv("RMWEB_BLOCK") != "0") {
+            WebKitUserContentFilterStore *store = webkit_user_content_filter_store_new("/home/root/rmweb/cfstore");
+            GBytes *src = g_bytes_new_static(kBlockRules, strlen(kBlockRules));
+            webkit_user_content_filter_store_save(store, "rmweb-block", src, m_cancel, &WpeEngine::onFilterSaved, this);
+            g_bytes_unref(src);
+        } else {
+            loadInitial();
+        }
+    }
+    void toggleWebFontsSetting() {
+        m_settings.webFonts = !m_settings.webFonts;
+        rmweb::saveSettings(m_profileDir, m_settings);
+        if (!m_settings.webFonts) {
+            if (m_fontFilter) { webkit_user_content_manager_add_filter(m_ucm, m_fontFilter);
+                                qInfo("[fonts] web fonts off (settings)"); }
+            else compileFontFilter();   // first disable this run: async, adds on save
+        } else if (m_fontFilter) {
+            webkit_user_content_manager_remove_filter(m_ucm, m_fontFilter);
+            qInfo("[fonts] web fonts on (settings)");
+        }
+    }
+    void compileFontFilter() {
+        WebKitUserContentFilterStore *store = webkit_user_content_filter_store_new("/home/root/rmweb/cfstore");
+        GBytes *src = g_bytes_new_static(kNoFontsRules, strlen(kNoFontsRules));
+        webkit_user_content_filter_store_save(store, "rmweb-nofonts", src, m_cancel,
+                                              &WpeEngine::onFontFilterSaved, this);
+        g_bytes_unref(src);
+    }
+    static void onFontFilterSaved(GObject *obj, GAsyncResult *res, gpointer data) {
+        auto *self = static_cast<WpeEngine*>(data);
+        GError *err = nullptr;
+        WebKitUserContentFilter *f = webkit_user_content_filter_store_save_finish(
+            WEBKIT_USER_CONTENT_FILTER_STORE(obj), res, &err);
+        if (err && g_error_matches(err, G_IO_ERROR, G_IO_ERROR_CANCELLED)) {   // engine tearing down
+            if (f) webkit_user_content_filter_unref(f);
+            g_clear_error(&err); g_object_unref(obj); return;
+        }
+        if (f) { if (self->m_fontFilter) webkit_user_content_filter_unref(self->m_fontFilter);
+                 self->m_fontFilter = f;
+                 // Honour the CURRENT setting (the user may have toggled back while this compiled).
+                 if (!self->m_settings.webFonts) { webkit_user_content_manager_add_filter(self->m_ucm, f);
+                                                   qInfo("[fonts] web fonts blocked"); } }
+        else   { qWarning("[fonts] filter compile failed: %s", err ? err->message : "?"); g_clear_error(&err); }
+        g_object_unref(obj);
+        if (self->m_fontFilterStartup) { self->m_fontFilterStartup = false; self->startBlockFilter(); }
     }
     // First enable of blocking at runtime (startup had it off): same store-save compile as startup,
     // but the callback only adopts the filter — it must NOT kick a fresh initial load.
@@ -2267,6 +2329,8 @@ private:
     rmweb::Settings m_settings;
     std::string m_envUa;                    // RMWEB_UA override — runtime only, NEVER persisted (wins over m_settings.ua)
     int m_envAutoRefreshSec = -1;           // RMWEB_AUTOREFRESH_MS override in seconds (-1 = unset) — runtime only, never persisted
+    WebKitUserContentFilter *m_fontFilter = nullptr;   // "web fonts off" rule list (our ref) — settings toggle
+    bool m_fontFilterStartup = false;                   // its startup compile continues the filter chain
     WebKitUserContentFilter *m_blockFilter = nullptr;  // compiled rule list (our ref) — settings toggle
     bool m_siteCssOn = false;          // kSiteCss currently in the UCM (mirrors settings after a toggle)
     std::vector<rmweb::ScrollEntry> m_scroll;       // per-URL reading positions (scroll.txt)
@@ -2337,7 +2401,10 @@ public:
         // EPRenderLoop still crashes intermittently on region presents under storms even with the
         // idempotent gate (device-verified 2026-09-25); full-screen presents are the safe default.
         connect(&m_settleFlash, &QTimer::timeout, this, [this]{
-            if (m_bwFast || m_editing || !m_epd || !m_settleOn || m_exiting) return;   // no flash over fast mono / typing / off / exiting
+            // Also in B&W fast mode: its fast mono updates underdrive black when a page REDRAWS over
+            // itself (late layout shifts re-push every text pixel), leaving the final render paler than
+            // the first — one full develop once the page is quiet restores it.
+            if (m_editing || !m_epd || !m_settleOn || m_exiting) return;   // no flash while typing / off / exiting
             if (m_inFlight) { m_settleFlash.start(500); return; }   // present still on the panel — retry
             qCDebug(lcEngine, "[t][gui] settle flash (full develop)");
             manualFullSwap();
@@ -2633,7 +2700,7 @@ public:
         m_editBuf.clear();
         // Typing suppressed the settle flash (the lambda skips while editing) — re-arm it now,
         // or a page that went quiet DURING the edit would never get its full-quality develop.
-        if (m_settleOn && m_settleFullMs > 0 && !m_bwFast) m_settleFlash.start(m_settleFullMs);
+        if (m_settleOn && m_settleFullMs > 0) m_settleFlash.start(m_settleFullMs);
         scheduleDirty(editZones(), /*guardTouch=*/false);
     }
     void clearEditBuf() {
@@ -3249,7 +3316,12 @@ private:
         // under frame storms) but always on while EDITING: keyboard/echo updates are human-paced
         // (>=120 ms coalesced, gate-serialized), and full-screen repaints per keystroke are exactly
         // the "typing redraws everything" bug (user report 2026-09-26).
-        const bool regional = m_partial || m_editing;
+        // Chrome-only presents (no new page pixels: loading badge, address bar, reader icon, toast) are
+        // regional too — each one used to redraw the WHOLE panel, so a page load cost ~3 extra
+        // full-screen e-ink updates on top of its content (device log 2026-10-13: 5 presents for 2
+        // content frames). These are rare, human-paced events like typing, and their zones are
+        // marked by the setters (scheduleDirty) — not the content-strip storms the opt-in guards.
+        const bool regional = m_partial || m_editing || !hadContent;
         if (regional && m_dirtyAccum.isNull()) { m_dirty = false; return; }
         m_lastPresentHadContent = hadContent;
         m_dirty = false; m_inFlight = true;
@@ -3821,7 +3893,10 @@ int main(int argc, char **argv) {
                 static bool dumpWarned = false;
                 const QString out = QString::fromUtf8(dumpDir)
                                   + QStringLiteral("/frame-%1.png").arg(frame, 5, 10, QLatin1Char('0'));
-                if (!(dumpReady && view->contentImage().save(out)) && !dumpWarned) {
+                // A full frame is saved as delivered (the canvas only adopts it at the next present, so
+                // contentImage() would lag one frame); a damage strip saves the merged canvas.
+                const QImage shot = dirty.isNull() ? img : view->contentImage();
+                if (!(dumpReady && !shot.isNull() && shot.save(out)) && !dumpWarned) {
                     dumpWarned = true;   // once is enough — don't spam the persistent log per frame
                     qWarning("[dbg] RMWEB_DUMP_FRAMES: cannot save %s", qPrintable(out));
                 }

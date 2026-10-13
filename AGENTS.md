@@ -123,6 +123,19 @@ at the panel.
   now uses `bufferDiffBBox`; changes confined to the right 16 px scrollbar gutter are ignored,
   because WebKit's scrollbar fade ticks every ~110 ms for ~2.5 s after each load. The sig stays
   for logging and blank-page detection only.
+- **Page loads: chrome-only presents are regional; settle develop also runs in B&W mode**
+  (fork.6, user-confirmed improvement 2026-10-13).
+  - Before, a load cost ~5 full-panel updates: 2 content frames + ~3 full repaints for
+    badge/address/reader-icon changes. Chrome-only changes now present just their zones.
+  - Pages that shift after first paint (late JS layout changes) re-push every text pixel with
+    the fast waveform, which underdraws black, so the final render looked paler than the first.
+    The settle flash (one full develop once quiet) now also fixes this in B&W mode.
+- **"Web fonts" setting** (`webFonts=`, default on) is a separate content filter
+  (`kNoFontsRules`) that blocks all font loads. It made no difference on the page that motivated
+  it; its benefit is unproven.
+- **`RMWEB_DUMP_FRAMES`** now saves each delivered full frame (it used to save the lagging canvas,
+  so the first frames were missing). Compare frames with Pillow in a venv; the tablet has no
+  `timeout` command.
 - **A grab can come out partly black** mid-refresh (seen in landscape). Retake it later before
   calling it a bug.
 - **Debug env survives a relaunch.** After an exit-75 orientation restart, the relaunched app

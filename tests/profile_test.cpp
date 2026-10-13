@@ -232,6 +232,9 @@ int main() {
     { Settings sr; sr.rotate = 0;   CHECK(saveSettings(dir, sr)); CHECK(loadSettings(dir).rotate == 0); }
     CHECK(detail::atomicWrite(dir + "/settings.txt", "rotate=180\n"));
     CHECK(loadSettings(dir).rotate == -1);
+    // webFonts: default on, round-trips off
+    CHECK(loadSettings(dir).webFonts);
+    { Settings sw; sw.webFonts = false; CHECK(saveSettings(dir, sw)); CHECK(!loadSettings(dir).webFonts); }
 
     // Duplicate URLs in the store (hand-edited file): loadBookmarks keeps both — no dedupe on
     // load — and toggleBookmark removes only the FIRST match. Current behavior, pinned here.

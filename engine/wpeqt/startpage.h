@@ -231,8 +231,13 @@ inline std::string buildSettingsPage(const Settings& s) {
          "photos darken a bit too). Off in B&amp;W fast mode (that path boosts on its own).</div>";
     row(icon::zap, "rmweb:toggle-settleflash", "Settle flash (deepen blacks)", onoff[s.settleFlash ? 1 : 0]);
     h += "<div class='hint'>One full-quality flash after the page goes quiet; deepens blacks that quick "
-         "updates underdrive. Off in B&amp;W fast mode.</div>";
+         "updates underdrive (also in B&amp;W fast mode, where a page that shifts after loading otherwise "
+         "ends up paler than its first render).</div>";
     row(icon::zap, "rmweb:clear-ghosting", "Clear ghosting now", "run");
+    row(icon::type, "rmweb:toggle-webfonts", "Web fonts", onoff[s.webFonts ? 1 : 0]);
+    h += "<div class='hint'>Off: pages use the tablet's own fonts &mdash; one render instead of a second "
+         "repaint when the site's font arrives, and darker text. Some icon buttons may show as plain "
+         "text. Applies from the next page load.</div>";
     h += "<h2>Sites</h2>";
     row(icon::smartphone, "rmweb:toggle-ua", "Site version", s.ua == "mobile" ? "mobile (lighter)" : "desktop");
     row(icon::shield, "rmweb:toggle-block", "Ad &amp; tracker blocking", onoff[s.block ? 1 : 0]);

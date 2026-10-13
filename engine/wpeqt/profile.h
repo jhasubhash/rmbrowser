@@ -27,6 +27,8 @@ struct Settings { double zoom = 0.5; int readerFont = 30; std::string ua; bool r
                                             // (the QPA auto waveform underdrives black on fast presents)
                   int autoRefreshSec = 15;  // >0: min seconds between same-URL auto-navigations;
                                             // 0: guard off (allow all); -1: block all auto-refreshes
+                  bool webFonts = true;     // false: block all downloadable fonts (one render, darker
+                                            // device fonts on e-ink; icon fonts degrade)
                   int rotate = -1;          // screen orientation: -1 auto (accelerometer, default),
                                             // 0 portrait, 90 landscape, 270 landscape (flipped)
                                             // — rotate.h; read at startup
@@ -315,6 +317,7 @@ inline Settings loadSettings(const std::string& dir) {
         else if (k == "settleFlash") s.settleFlash = (v != "0");   // default ON: same rule
         else if (k == "autoRefreshSec") s.autoRefreshSec = std::atoi(v.c_str());
         else if (k == "rotate") s.rotate = std::atoi(v.c_str());
+        else if (k == "webFonts") s.webFonts = (v != "0");     // default ON: absent/corrupt stays true
     }
     if (s.rotate != -1 && s.rotate != 0 && s.rotate != 90 && s.rotate != 270) s.rotate = -1;   // invalid -> auto
     if (!(s.zoom >= 0.5 && s.zoom <= 3.0)) s.zoom = 0.5;                 // clamp corrupt values (0.5 = the default)
@@ -338,7 +341,8 @@ inline bool saveSettings(const std::string& dir, const Settings& s) {
                     + "textBoost=" + std::string(s.textBoost ? "1" : "0") + "\n"
                     + "settleFlash=" + std::string(s.settleFlash ? "1" : "0") + "\n"
                     + "autoRefreshSec=" + std::to_string(s.autoRefreshSec) + "\n"
-                    + "rotate=" + std::to_string(s.rotate) + "\n";
+                    + "rotate=" + std::to_string(s.rotate) + "\n"
+                    + "webFonts=" + std::string(s.webFonts ? "1" : "0") + "\n";
     return detail::atomicWrite(dir + "/settings.txt", out);
 }
 
