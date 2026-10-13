@@ -2152,7 +2152,25 @@ private:
         // Skip identical frames: WebKit re-submits the same composited buffer on its idle heartbeat, and
         // the rAF page-turn pulse yields several identical ticks. Only repaint the e-ink when pixels change
         // — this kills the wasteful periodic re-present and any flicker from the nudge.
-        const bool changed = (sig != self->m_lastSig);
+        // The sparse sig alone is NOT a safe dup test: it samples one pixel per 40x40 cell, so a small
+        // change between samples (an "on"/"off" pill on the settings page, a caret, a checkbox) hashed
+        // "dup" and was never presented — the setting flipped but the screen kept the old value
+        // (device-verified 2026-10-13). Decide on the EXACT row diff against the last emitted frame
+        // instead (computed here once and reused for the damage strip below; identical frames stop at
+        // the first memcmp of each row).
+        const bool havePrev = !self->m_prevFrame.isNull() && self->m_prevFrame.width() == w
+                              && self->m_prevFrame.height() == h
+                              && self->m_prevFrame.format() == QImage::Format_ARGB32;
+        int rowsChanged = 0;
+        QRect dirty = bufferDiffBBox(pix, stride, w, h, self->m_prevFrame, &rowsChanged);
+        // ...except the scrollbar gutter: WebKit's scrollbar fades out for ~2.5 s after every load,
+        // ticking a 6 px strip at the right edge every ~110 ms (device log). Exact diffing would turn
+        // that into a stream of full-panel e-ink presents for nothing visible, so a change confined to
+        // the rightmost kScrollbarGutter px is not "new" (m_prevFrame keeps the old pixels, so it stays
+        // ignored until real content changes and carries it along).
+        static const int kScrollbarGutter = 16;
+        const bool gutterOnly = havePrev && rowsChanged > 0 && dirty.x() >= w - kScrollbarGutter;
+        const bool changed = !havePrev || (rowsChanged > 0 && !gutterOnly);
         self->m_lastSig = sig;
 
         const double dt   = self->m_lastBufUs ? (tIn - self->m_lastBufUs) / 1000.0 : 0.0;
@@ -2169,9 +2187,7 @@ private:
         // (m_prevFrame, worker-only) and ship just the damage strip. Full frame on first/size-change/
         // unknown; a strip is exactly the bbox (bbox-sized QImage) and the GUI merges it in place.
         // m_prevFrame is a WORKER-OWNED deep copy (never shared — strip merges write in place).
-        const gint64 tDiff = g_get_monotonic_time();
-        int rowsChanged = 0;
-        QRect dirty = bufferDiffBBox(pix, stride, w, h, self->m_prevFrame, &rowsChanged);
+        const gint64 tDiff = g_get_monotonic_time();   // times the strip copy (the diff ran above, in the dup test)
         // Big damage (real page turns) ships FULL frames, not strips: WebKit's tiled renderer can
         // paint the same viewport in passes seconds apart, so a turn arrives as several strips at
         // different scroll positions. Full replacement self-heals that every frame; strips would

@@ -117,6 +117,14 @@ at the panel.
   xochitl (re)started made xochitl SEGV on stop, and `OnFailure` triggered an emergency reboot.
   Before each test launch, poll until `systemctl is-active xochitl` and the xochitl process is
   ≥ 15 s old (`/proc/<pid>/stat` field 22 vs `/proc/uptime`). Don't use a fixed sleep.
+- **Frame dup test = exact row diff** (fixed 2026-10-13, fork.4). Upstream decided "new frame?"
+  from a sparse fingerprint (1 pixel per 40×40 cell), which dropped small changes. Settings-page
+  toggles flipped the value but never redrew it: the reloaded page hashed identical. The engine
+  now uses `bufferDiffBBox`; changes confined to the right 16 px scrollbar gutter are ignored,
+  because WebKit's scrollbar fade ticks every ~110 ms for ~2.5 s after each load. The sig stays
+  for logging and blank-page detection only.
+- **A grab can come out partly black** mid-refresh (seen in landscape). Retake it later before
+  calling it a bug.
 - **Debug env survives a relaunch.** After an exit-75 orientation restart, the relaunched app
   inherits `RMWEB_DEBUG_UITAP*`/`RMWEB_GRAB_MS` and replays them in the new orientation. Never leave xochitl stopped: wrap test scripts in
   `trap "systemctl start xochitl" EXIT HUP INT TERM`.
