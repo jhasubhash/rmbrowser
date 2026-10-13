@@ -55,7 +55,7 @@ preflight() {
 }
 
 install_rmweb() {
-  say "Installing rmweb $RMWEB_VERSION"
+  say "Installing rmweb ${RMWEB_TARBALL:-release v$RMWEB_VERSION}"
   local tb="${RMWEB_TARBALL:-}"
   if [ -z "$tb" ]; then tb="$WORK/rmweb.tar.gz"; fetch "$RMWEB_URL" "$tb"; fi
   rm_ssh 'pidof rmweb-wpeqt >/dev/null && { echo "quit rmweb on the tablet first (⏻)" >&2; exit 1; }; true' \
