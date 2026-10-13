@@ -1,114 +1,79 @@
-# rmweb
+<div align="center">
 
-> **Fork note:** this is a personal fork of [exp78/rmweb](https://github.com/exp78/rmweb), starting
-> at v0.9.7. For a tested install/recovery runbook see [`docs/paper-pro-setup.md`](docs/paper-pro-setup.md)
-> and `./scripts/setup-device.sh`. Agent and contributor guide: [`AGENTS.md`](AGENTS.md).
-> **Requires reMarkable OS ≥ 3.28 and AppLoad ≥ v0.6.0.**
-> Fork additions: **landscape + auto-rotation** (follows the tablet; Settings → Display → Screen orientation) and a minutes-long
-> app-only build (`./scripts/fast-build.sh all`) that reuses the upstream release's prebuilt engine.
+# rmbrowser
 
-A native **WPE WebKit** web browser for the **reMarkable Paper Pro** e-ink tablet.
+**A real web browser on the reMarkable Paper Pro: in portrait or landscape, with one clean e-ink update per page.**
 
-Compatibility: reMarkable Paper Pro (verified on-device); reMarkable Paper Pro Move (untested -
-should work: panel geometry is runtime-derived, testers welcome, see issues).
+Wikipedia, blogs, news and arXiv straight from the tablet's own Wi-Fi. No computer, no cloud.
+A fork of [rmweb](https://github.com/exp78/rmweb) with auto-rotation and a reworked e-ink refresh path.
 
-![start page](docs/screenshots/start-page.png)
+![reMarkable Paper Pro](https://img.shields.io/badge/reMarkable-Paper%20Pro-2a2420)
+![OS 3.28+](https://img.shields.io/badge/OS-3.28%2B-2a2420)
+![WPE WebKit](https://img.shields.io/badge/WPE%20WebKit-2.48-2a2420)
+[![License](https://img.shields.io/badge/license-MIT-2a2420)](LICENSE)
 
-> **Status: v0.9.7 - beta.** The primary use case is **reading**; general browsing is basic.
-> Implemented and verified on-device: reader mode (Mozilla Readability, light/dark theme), B2 chrome
-> painted into the frame (with C++ hit-test and inverted press feedback on every button and key),
-> touch input via evdev with a phantom-touch guard, on-screen URL keyboard, bookmarks/history/
-> settings persisted in the profile dir, a redesigned HTML start page (`rmweb:` scheme) with letter
-> avatars and a tabs-lite open-pages switcher, a **separate settings page** (tap-to-toggle rows,
-> applies immediately), page/reader zoom, content blocking (WebKit UserContentManager filter) with
-> **cosmetic rules that collapse blocked-ad containers** (no white holes), an e-ink **calm-down
-> stylesheet** (kills CSS animations/transitions/smooth scrolling), an **auto-refresh guard** that
-> throttles pages reloading themselves while you read, a loading pill with progress and a **stop
-> button**, persistent cookies (sqlite - logins survive relaunch), per-URL scroll restore, in-page
-> find (`/text` in the address bar), downloads to `~/Downloads` with **PDF/EPUB landing straight
-> in the reMarkable library** (visible after quit), form filling (tap a text field →
-> on-screen keyboard with its current value, password masked; tap toggles checkbox/radio and cycles
-> selects), learn-as-you-type autofill for email/username/name fields (passwords are never
-> learned), a per-host password store (obfuscated - NOT encrypted), styled error pages with Retry,
-> a TLS padlock, a per-host **continue-anyway for certificate errors** (captive portals on
-> hotel/cafe wifi; session-scoped), address-bar search over local bookmarks+history (with a web-search link),
-> long-press link peek, a **B&W fast mode** (grayscale present + the fast mono waveform) and a
-> **mobile/desktop UA toggle** (both in Settings), a **settle flash** (one full-quality panel develop
-> once the page goes quiet - deep black instead of washed-out ACeP grey) and a **text boost** contrast
-> toggle (Settings; default on), a KOReader-style reading-progress bar, a coherent **Lucide icon set** drawn
-> as vectors (crisp on e-ink, font-independent), a home-screen icon in the stock launcher (XOVI +
-> AppLoad), and a no-brick launcher that stops/restores xochitl. E-ink-safe: CPU-only llvmpipe +
-> Skia, ~120-250 ms page turns, low RAM.
-> A 2026-07-18 code review ([docs/review-2026-07-18.md](docs/review-2026-07-18.md)) found open
-> security/robustness issues; the HIGH/CRITICAL items were fixed after it (see git log), but treat
-> this as enthusiast-grade beta software, not a hardened product.
+<a href="https://www.buymeacoffee.com/subhashjha"><img src="https://img.buymeacoffee.com/button-api/?text=Buy%20me%20a%20coffee&emoji=&slug=subhashjha&button_colour=FFDD00&font_colour=000000&font_family=Cookie&outline_colour=000000&coffee_colour=ffffff" alt="Buy me a coffee" height="44"></a>
 
-## Screenshots
+</div>
 
-| | | |
-|---|---|---|
-| ![Wikipedia](docs/screenshots/wikipedia.jpg) | ![e-ink lab](docs/screenshots/eink-lab.png) | ![settings](docs/screenshots/settings.png) |
-| Wikipedia | e-ink lab (animations frozen, ad slots collapsed) | Settings page |
+| Landscape | Settings |
+|:---:|:---:|
+| ![Wikipedia in landscape](docs/screenshots/landscape-wikipedia.jpg) | ![The settings page](docs/screenshots/landscape-settings.jpg) |
+| Wikipedia's wide layout, the tablet turned on its side | Orientation, B&W fast mode, web fonts and more |
 
-More: [loading pill with stop button](docs/screenshots/loading-badge.png)
+## Install
 
-## Why it's interesting
+You need a Paper Pro on **reMarkable OS 3.28 or later** with **developer mode** on. Turning
+developer mode on factory-resets the tablet, so sync your notebooks first. Then, with the tablet
+plugged in over USB:
 
-The Paper Pro's i.MX8M Mini SoC actually has a GPU on die (Vivante GC7000 UltraLite), but the
-stock OS ships no driver for it (no `/dev/dri` render node) - so in practice everything renders
-on the CPU. rmweb renders the web entirely in software - **Skia CPU raster + Mesa llvmpipe
-(software EGL)** - and presents through reMarkable's e-ink display path.
-
-## Architecture (short)
-
-```
-input (touch) → shell (hand-painted C++ chrome on a QQuickPaintedItem) → engine (WPE, software GL)
-        ARGB8888 frame → display (Qt6 + epaper QPA) → imx-drm → E-Ink 1620×2160
+```sh
+git clone https://github.com/jhasubhash/rmbrowser && cd rmbrowser
+ssh-copy-id root@10.11.99.1            # once: the password is under Settings → General → About
+./scripts/setup-device.sh all          # browser + xovi + AppLoad + power-button toggle
 ```
 
-The design's five modules folded into `engine/wpeqt` (input/shell/display inside `main.cpp`), plus
-`device/` for the on-device glue.
-Full design: [`docs/superpowers/specs/2026-06-24-rmweb-browser-design.md`](docs/superpowers/specs/2026-06-24-rmweb-browser-design.md).
-Verified hardware facts: [`docs/device-profile.md`](docs/device-profile.md).
+Open **AppLoad → rmweb** on the tablet. After a reboot, triple-press the power button to bring
+AppLoad back. The full walkthrough, including what to do after an OS update, is in
+**[docs/paper-pro-setup.md](docs/paper-pro-setup.md)**. It's beta software that runs as root:
+use it at your own risk.
 
-## Target device
+## What it does
 
-reMarkable Paper Pro ("Ferrari"), Codex Linux (scarthgap), aarch64, kernel 6.12.49. GPU exists on
-the SoC but has no driver in the stock OS, so rendering is **CPU-only**.
-Everything installs under `/home/root/rmweb` (the rootfs is full). Cross-compiled with the
-official reMarkable "ferrari" Yocto SDK.
+| | |
+|---|---|
+| 🔄 **Follows the tablet** | Turn it and the page turns with it, back on the same page at the same spot. Respects the reMarkable rotation lock; pin an orientation in Settings if you prefer. |
+| 🖋️ **One update per page** | In B&W mode each page turn reaches the e-ink panel once, with a deep waveform: dark text, no flash. |
+| 🧭 **Toolbar stays still** | Page turns redraw only the page; the toolbar redraws only when it changes. |
+| 📖 **Made for reading** | Reader mode, bookmarks, history, in-page find, autofill and an ad and tracker blocker. |
+| 📄 **PDFs to your library** | Download a PDF or EPUB (an arXiv paper, say) and it lands in the reMarkable library. |
+| 🔤 **Your fonts or theirs** | Turn web fonts off for one render with the tablet's darker built-in fonts. |
+| ⚡ **Builds in a minute** | `./scripts/fast-build.sh all` rebuilds the app against the release's prebuilt engine, no multi-hour WebKit compile. |
 
-## Build & Install
+Heavy JavaScript web apps such as Gmail won't run well: the engine runs on the CPU without a
+JavaScript JIT. It's a reading browser.
 
-Prebuilt archives on [GitHub Releases](https://github.com/exp78/rmweb/releases) install without any
-toolchain - see [`docs/install.md`](docs/install.md).
+## Settings worth knowing
 
-Building from source needs a `linux/arm64` Docker engine (on macOS: colima + docker-buildx) and the
-reMarkable Yocto SDK - setup in [`toolchain/README.md`](toolchain/README.md). The WPE WebKit + Mesa
-build takes **hours and tens of GB of disk**.
+| | |
+|---|---|
+| **Screen orientation** | auto, portrait, landscape or landscape flipped |
+| **B&W fast mode** | grayscale pages with the fastest, darkest e-ink updates; best for reading |
+| **Site version** | *mobile* makes heavy news sites serve lighter pages |
+| **Web fonts** | *off* for one render with built-in fonts |
+| **Clear ghosting now** | one full refresh to wipe leftover images |
 
-```bash
-./scripts/fetch-sdk.sh                                # download the Yocto SDK once
-docker build -f toolchain/Dockerfile -t rmweb-sdk .   # cross-compile image
-./scripts/build-wpe.sh deps                           # WPE WebKit deps + Mesa llvmpipe (hours)
-./scripts/build-wpe.sh build                          # WPE WebKit itself
-./scripts/build-wpeqt.sh                              # build rmweb-wpeqt
-./scripts/bundle.sh                                   # create device bundle
-./scripts/run-wpeqt-on-device.sh show https://example.com
-```
+Open them from the start page: **Open settings**.
 
-Full instructions: [`docs/install.md`](docs/install.md)
+## Learn more
 
-## Roadmap / Planned
+- **[Setup and recovery](docs/paper-pro-setup.md)**: install, OS updates, troubleshooting, uninstall.
+- **[AGENTS.md](AGENTS.md)**: how the code is laid out, building, device testing and the e-ink gotchas.
+- **[Upstream README](docs/upstream-README.md)**: rmweb's own feature list and architecture.
 
-Not implemented yet (earlier docs claimed some of these by mistake - see the review above):
-on-device JS console, user/content scripts, performance dashboard.
+## Credits
 
-## Credits & License
-
-[MIT](LICENSE) - see the file for details. Third-party components (WPE WebKit, Qt6, Mesa,
-Mozilla Readability, Lucide icons, XOVI/AppLoad) and their licenses are listed in
-[NOTICE](NOTICE).
-
-Co-developed with AI pair-programming - many thanks to **Claude Code** (Anthropic), **Grok** (xAI)
-and **Kimi** (Moonshot AI), who wrote and reviewed large parts of this project.
+The browser itself is **[rmweb](https://github.com/exp78/rmweb)** by Eugene Tarakanov (exp78)
+and contributors. This fork adds landscape and auto-rotation, the single-update e-ink path, a
+few fixes, and the setup and fast-build scripts. Licensed under the [MIT License](LICENSE); see
+also [NOTICE](NOTICE) for the third-party components.
