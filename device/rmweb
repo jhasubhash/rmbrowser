@@ -54,6 +54,9 @@ cleanup(){
     systemctl is-active --quiet xochitl || log "WARN: xochitl still not active after restart"
   fi
   [ -n "${MOUNTED:-}" ] && umount /usr/libexec 2>/dev/null
+  # Auto-rotation raises the accelerometer's sample rate (faster one-shot reads); hand xochitl back
+  # the rate it had before we launched.
+  [ -n "${ACC_FREQ:-}" ] && [ -n "${ACC_FREQ_FILE:-}" ] && echo "$ACC_FREQ" > "$ACC_FREQ_FILE" 2>/dev/null
   # Release the lock ONLY if it's still ours (a takeover run replaced it with its own pid).
   [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
 }
@@ -80,6 +83,12 @@ echo $$ > "$LOCK/pid"
 
 rotate_log   # bound the persistent log before this run's appends
 log "start"
+# Remember the accelerometer sample rate (the app may raise it for auto-rotation; cleanup restores).
+for d in /sys/bus/iio/devices/iio:device*; do
+  if [ -e "$d/in_accel_x_raw" ] && [ -w "$d/sampling_frequency" ]; then
+    ACC_FREQ_FILE="$d/sampling_frequency"; ACC_FREQ="$(cat "$ACC_FREQ_FILE" 2>/dev/null)"; break
+  fi
+done
 if systemctl is-active --quiet xochitl; then
   log "stopping xochitl"
   # STOPPED before the stop: on the appload fallback path (no systemd-run) the stop SIGTERMs our own
@@ -106,18 +115,23 @@ fi
 . "$R/rmweb-env.sh"
 
 rotate_log   # the app's own append below is the main growth source
-# Exit code 75 (kExitRestart in main.cpp) = "relaunch me" (settings-page orientation change): run the
-# app again WITHOUT restoring xochitl in between — a xochitl stop/start pair per relaunch would burn
-# its StartLimitBurst (4 per 10 min -> emergency reboot). Bounded, so a crash-looping restart can't spin.
-RELAUNCHES=0
+# Exit code 75 (kExitRestart in main.cpp) = "relaunch me" (orientation change: auto-rotation or the
+# settings page): run the app again WITHOUT restoring xochitl in between — a xochitl stop/start pair
+# per relaunch would burn its StartLimitBurst (4 per 10 min -> emergency reboot). Rotations are
+# unlimited over a reading session; only RAPID relaunches (a run shorter than RMWEB_RELAUNCH_MIN_S)
+# count toward the guard, so a restart loop gives up after 3 instead of spinning.
+RELAUNCHES=0; QUICK=0; MIN_RUN="${RMWEB_RELAUNCH_MIN_S:-10}"
 while :; do
   log "launch rmweb-wpeqt $*"
+  t0=$(date +%s)
   "$R/bin/rmweb-wpeqt" "$@" >> "$LOG" 2>&1 &
   APP=$!
   wait "$APP"
   rc=$?
   log "rmweb-wpeqt exited rc=$rc"
-  [ "$rc" = 75 ] && [ "$RELAUNCHES" -lt 5 ] || break
+  [ "$rc" = 75 ] || break
+  if [ $(( $(date +%s) - t0 )) -lt "$MIN_RUN" ]; then QUICK=$((QUICK+1)); else QUICK=0; fi
+  [ "$QUICK" -le 3 ] || { log "WARN: $QUICK rapid relaunches in a row — giving up"; break; }
   RELAUNCHES=$((RELAUNCHES+1))
   # Same hygiene as cleanup(): WPE helpers can outlive the UI process, and the next instance must
   # not start into a still-held epaper framebuffer.

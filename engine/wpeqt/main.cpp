@@ -101,6 +101,69 @@ static QRect logicalRectToPhys(const QRect &r) {
     const rmweb::IRect p = rmweb::logicalRectToPhys(kRotate, kPhysW, kPhysH, {r.x(), r.y(), r.width(), r.height()});
     return QRect(p.x, p.y, p.w, p.h);
 }
+
+// --- Auto-rotation: the accelerometer via IIO sysfs (Paper Pro: lis2dw12_accel, ~12 Hz) ---------
+// Polled from the GUI thread (a few small sysfs reads every 500 ms). Raw axes go through the chip's
+// mount matrix into the device frame that rmweb::classifyOrientation expects.
+struct Accel { std::string dir; double m[9] = {1, 0, 0, 0, 1, 0, 0, 0, 1}; bool ok = false; };
+static Accel g_accel;
+static bool g_autoRotate = false;   // setting == auto, sensor present, reMarkable rotation not locked
+static bool readSysfsLine(const std::string &path, std::string &out) {
+    FILE *f = fopen(path.c_str(), "re");
+    if (!f) return false;
+    char buf[256];
+    const bool ok = fgets(buf, sizeof buf, f) != nullptr;
+    fclose(f);
+    if (ok) { out = buf; while (!out.empty() && (out.back() == '\n' || out.back() == ' ')) out.pop_back(); }
+    return ok;
+}
+static Accel openAccel() {
+    Accel a;
+    DIR *d = opendir("/sys/bus/iio/devices");
+    if (!d) return a;
+    while (struct dirent *e = readdir(d)) {
+        const std::string dir = std::string("/sys/bus/iio/devices/") + e->d_name;
+        std::string probe;
+        if (strncmp(e->d_name, "iio:device", 10) != 0 || !readSysfsLine(dir + "/in_accel_x_raw", probe)) continue;
+        a.dir = dir; a.ok = true;
+        // Faster ODR = faster one-shot reads (see readAccelOrientation). device/rmweb records the
+        // original rate before launch and restores it on exit, so xochitl gets its setting back.
+        if (FILE *f = fopen((dir + "/sampling_frequency").c_str(), "we")) { fputs("50", f); fclose(f); }
+        std::string mm;
+        if (readSysfsLine(dir + "/in_accel_mount_matrix", mm) && !rmweb::parseMountMatrix(mm, a.m))
+            qWarning("[rotate] bad mount matrix '%s' — using identity", mm.c_str());
+        break;
+    }
+    closedir(d);
+    return a;
+}
+// One accelerometer sample -> 0/90/270, or -1 (flat / upside-down / diagonal / read error).
+// BLOCKING: the lis2dw12 driver takes a fresh one-shot measurement per sysfs read and waits a few
+// ODR periods for it (~670 ms per axis at the stock 12 Hz, ~70 ms at 100 Hz — device-measured), so
+// only the startup probe calls this on the GUI thread; the auto-rotate poller runs it on its own
+// thread. dev (optional) receives the device-frame vector for logging.
+static int readAccelOrientation(const Accel &a, double *dev = nullptr) {
+    if (!a.ok) return -1;
+    double raw[3];
+    const char *axes[3] = {"x", "y", "z"};
+    for (int i = 0; i < 3; ++i) {
+        std::string v;
+        if (!readSysfsLine(a.dir + "/in_accel_" + axes[i] + "_raw", v)) return -1;
+        raw[i] = std::strtod(v.c_str(), nullptr);
+    }
+    const double *m = a.m;
+    double d[3];
+    for (int r = 0; r < 3; ++r) d[r] = m[3 * r] * raw[0] + m[3 * r + 1] * raw[1] + m[3 * r + 2] * raw[2];
+    if (dev) { dev[0] = d[0]; dev[1] = d[1]; dev[2] = d[2]; }
+    return rmweb::classifyOrientation(d[0], d[1], d[2]);
+}
+// The reMarkable's own rotation lock (quick settings) — honoured by auto mode. xochitl is stopped
+// while rmweb runs, so its config can't change under us: reading it once at startup is enough.
+static bool xochitlOrientationLocked() {
+    for (const auto &ln : rmweb::detail::readLines("/home/root/.config/remarkable/xochitl.conf"))
+        if (ln == "OrientationLocked=true") return true;
+    return false;
+}
 // (swipe/tap thresholds live in gesture.h GestureParams — single source of truth; the page-turn
 //  step itself is innerHeight*0.92, computed in the pageBy JS — callers pass only a direction)
 
@@ -1532,6 +1595,20 @@ private:
     }
 
     void loadInitial() {
+        // A restart for rotation hands the page over in resume.txt (one-shot; ignored when stale, so
+        // a file left by a crash mid-restart can't hijack a launch much later). It wins over the
+        // launch URL: the launcher relaunches with the ORIGINAL arguments.
+        const std::string resumePath = m_profileDir + "/resume.txt";
+        struct stat rs {};
+        if (stat(resumePath.c_str(), &rs) == 0) {
+            const auto lines = rmweb::detail::readLines(resumePath);
+            ::unlink(resumePath.c_str());
+            const bool fresh = (time(nullptr) - rs.st_mtime) < 120;
+            if (fresh && !lines.empty() && rmweb::isSafeLinkUrl(lines[0])) {
+                qInfo("[rotate] resuming %s", lines[0].c_str());
+                m_url = QString::fromStdString(lines[0]);
+            }
+        }
         if (m_url.isEmpty()) {
             // No URL given: show the start page (bookmarks + recent history). goHome() is already
             // marshalled to the worker context via marshalToCtx, which is safe to call from here
@@ -2697,6 +2774,7 @@ public Q_SLOTS:
     void setTlsState(int s)        { if (s != m_tlsState) { m_tlsState = s; scheduleDirty(barZone()); } }   // 0 none, 1 https, 2 https+cert errors
     void setRendering(bool v)      { if (v != m_rendering)  { m_rendering  = v; scheduleDirty(pillZone()); } }
     void setAddr(const QString &s) { if (s != m_addr)     { m_addr     = s; scheduleDirty(barZone()); } }
+    QString addr() const { return m_addr; }   // current page URL (or a typed search) — restart resume
     void setReaderMode(bool v)     { if (v != m_readerMode)  { m_readerMode  = v; scheduleDirty(barZone()); } }
     void setReaderable(bool v)     { if (v != m_readerable) { m_readerable = v; scheduleDirty(barZone()); } }
     void setBookmarked(bool v) { if (v != m_bookmarked) { m_bookmarked = v; scheduleDirty(barZone()); } }
@@ -3622,17 +3700,35 @@ int main(int argc, char **argv) {
     // Orientation: the persisted setting (settings page), overridable per run with RMWEB_ROTATE
     // (0/90/270 or portrait/landscape/landscape-flipped). Read here — before the engine sizes its
     // viewport from kPanelW/H — straight from the profile (the engine loads it again on its thread).
+    const char *profileEnv = getenv("RMWEB_PROFILE");
+    const std::string profileDir = (profileEnv && *profileEnv) ? profileEnv : "/home/root/.rmweb";
     {
-        const char *pd = getenv("RMWEB_PROFILE");
-        kRotate = rmweb::loadSettings((pd && *pd) ? pd : "/home/root/.rmweb").rotate;
+        int setting = rmweb::loadSettings(profileDir).rotate;
         if (const char *rv = getenv("RMWEB_ROTATE"); rv && *rv) {
             const int r = rmweb::parseRotation(rv);
-            if (r >= 0) kRotate = r;
-            else qWarning("[panel] ignoring malformed RMWEB_ROTATE='%s' (want 0|90|270)", rv);
+            if (r >= rmweb::kRotateAuto) setting = r;
+            else qWarning("[panel] ignoring malformed RMWEB_ROTATE='%s' (want auto|0|90|270)", rv);
         }
-        if (kRotate && qEnvironmentVariableIsSet("RMWEB_PANEL")) {
-            qWarning("[panel] RMWEB_PANEL dry-run is portrait-only — ignoring rotation");
-            kRotate = 0;
+        if (qEnvironmentVariableIsSet("RMWEB_PANEL")) {
+            if (setting != 0) qWarning("[panel] RMWEB_PANEL dry-run is portrait-only — ignoring rotation");
+            setting = 0;
+        }
+        if (setting == rmweb::kRotateAuto) {
+            // Auto: the accelerometer decides the starting orientation; lying flat (no decision) or
+            // no sensor -> the last orientation we showed (orientation.txt, written on every change).
+            const auto last = rmweb::detail::readLines(profileDir + "/orientation.txt");
+            const int lastRot = last.empty() ? 0 : rmweb::normalizeRotation(std::atoi(last[0].c_str()));
+            g_accel = openAccel();
+            const bool locked = xochitlOrientationLocked();
+            const int sensed = locked ? -1 : readAccelOrientation(g_accel);
+            kRotate = sensed >= 0 ? sensed : lastRot;
+            g_autoRotate = g_accel.ok && !locked;
+            qInfo("[rotate] auto: sensor=%s sensed=%d last=%d locked=%d -> %d", g_accel.ok ? g_accel.dir.c_str() : "none",
+                  sensed, lastRot, locked ? 1 : 0, kRotate);
+            if (kRotate != lastRot)
+                rmweb::detail::atomicWrite(profileDir + "/orientation.txt", std::to_string(kRotate) + "\n");
+        } else {
+            kRotate = setting;
         }
         if (kRotate) rmweb::logicalSize(kRotate, kPhysW, kPhysH, kPanelW, kPanelH);
     }
@@ -3775,13 +3871,56 @@ int main(int argc, char **argv) {
         // Orientation change (settings page): same clean exit as ⏻ — drain the in-flight e-ink
         // present, flush the profile (the new rotation is already saved) — but exit kExitRestart so
         // device/rmweb relaunches straight into the new orientation (xochitl stays stopped).
-        QObject::connect(&engine, &WpeEngine::restartRequested, &app, [&engine, view]{
+        // newRot >= 0: the orientation auto-rotation decided (recorded so the relaunch can fall back
+        // to it if the tablet is laid flat meanwhile). The current web page is handed over in
+        // resume.txt: the relaunched engine reopens it (and per-URL scroll restore puts the reader
+        // back where they were) instead of dropping them on the start page.
+        auto restartApp = [&engine, view, profileDir](const char *why, int newRot) {
             if (view->isExiting()) return;
-            qInfo("[exit] restart for orientation change");
+            qInfo("[exit] restart: %s", why);
+            const QString addr = view->addr();
             view->drainForExit();
             engine.flushSync();
+            if (newRot >= 0)
+                rmweb::detail::atomicWrite(profileDir + "/orientation.txt", std::to_string(newRot) + "\n");
+            if (addr.startsWith(QLatin1String("https://")) || addr.startsWith(QLatin1String("http://")))
+                rmweb::detail::atomicWrite(profileDir + "/resume.txt", addr.toStdString() + "\n");
+            fflush(nullptr);
             std::_Exit(kExitRestart);
-        }, Qt::QueuedConnection);
+        };
+        QObject::connect(&engine, &WpeEngine::restartRequested, &app,
+                         [restartApp]{ restartApp("orientation setting changed", -1); }, Qt::QueuedConnection);
+        // Auto-rotation: sample the accelerometer every 500 ms; rotate only after the SAME new
+        // orientation was seen 3 times in a row (~1-1.5 s held), never while typing (the restart
+        // would drop the text) — classifyOrientation's dead band handles wobble near the diagonal.
+        if (g_autoRotate) {
+            // Sensor thread: blocking sysfs reads (see readAccelOrientation) must never stall the
+            // GUI loop (the 12 s watchdog, and every present). It posts each decision to the GUI,
+            // which owns the streak logic; a changed decision is logged with its vector.
+            auto onSample = [view, restartApp, cand = -1, streak = 0](int o) mutable {
+                if (view->isExiting()) return;
+                if (o < 0 || o == kRotate) { cand = -1; streak = 0; return; }
+                if (o != cand) { cand = o; streak = 1; return; }
+                if (++streak < 3 || view->isEditing()) return;
+                qInfo("[rotate] tablet turned: %d -> %d", kRotate, o);
+                restartApp("auto-rotate", o);
+            };
+            // GUI-owned handler with a stable address for the process lifetime (exit is always _Exit).
+            auto *handler = new std::function<void(int)>(std::move(onSample));
+            std::thread([&app, handler] {
+                int prev = -2;
+                for (;;) {
+                    g_usleep(400000);
+                    double d[3] = {0, 0, 0};
+                    const int o = readAccelOrientation(g_accel, d);
+                    if (o != prev) {
+                        qInfo("[rotate] sensor (%.0f, %.0f, %.0f) -> %d", d[0], d[1], d[2], o);
+                        prev = o;
+                    }
+                    QMetaObject::invokeMethod(&app, [handler, o]{ (*handler)(o); }, Qt::QueuedConnection);
+                }
+            }).detach();
+        }
         // Form fields: a tapped text field opens the keyboard on its current value (or an autofill
         // prefill when the field is empty); Go commits the typed text into the page field (native
         // setter + input/change events) and learns it for future prefills.

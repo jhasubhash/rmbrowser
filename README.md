@@ -4,7 +4,7 @@
 > at v0.9.7. For a tested install/recovery runbook see [`docs/paper-pro-setup.md`](docs/paper-pro-setup.md)
 > and `./scripts/setup-device.sh`. Agent and contributor guide: [`AGENTS.md`](AGENTS.md).
 > **Requires reMarkable OS ≥ 3.28 and AppLoad ≥ v0.6.0.**
-> Fork additions: **landscape mode** (Settings → Display → Screen orientation) and a minutes-long
+> Fork additions: **landscape + auto-rotation** (follows the tablet; Settings → Display → Screen orientation) and a minutes-long
 > app-only build (`./scripts/fast-build.sh all`) that reuses the upstream release's prebuilt engine.
 
 A native **WPE WebKit** web browser for the **reMarkable Paper Pro** e-ink tablet.

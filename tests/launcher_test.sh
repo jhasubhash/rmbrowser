@@ -22,7 +22,7 @@ setup(){ # fresh device-root + stubs + fake app; $1 = app mode (clean|crash|hang
   { echo '#!/bin/sh'; echo 'echo "app $*" >> "'"$STUBLOG"'"';
     echo 'n=$(cat "'"$R"'/.runs" 2>/dev/null || echo 0); n=$((n+1)); echo "$n" > "'"$R"'/.runs"';
     echo 'case "${APP_MODE:-clean}" in clean) exit 0;; crash) exit 1;; hang) sleep 30;;';
-    echo '  restart-once) [ "$n" = 1 ] && exit 75; exit 0;; restart-loop) exit 75;; esac'; } > "$R/bin/rmweb-wpeqt"
+    echo '  restart-once) [ "$n" = 1 ] && exit 75; exit 0;; restart-loop) exit 75;; restart-7) [ "$n" -le 7 ] && exit 75; exit 0;; esac'; } > "$R/bin/rmweb-wpeqt"
   chmod +x "$R/bin/rmweb-wpeqt"
 }
 
@@ -104,10 +104,16 @@ starts=$(grep -c "systemctl start xochitl" "$STUBLOG"); stops=$(grep -c "systemc
 [ "$starts" = 1 ] && [ "$stops" = 1 ] || { echo "  FAIL: expected 1 stop + 1 start, got $stops/$starts"; cat "$STUBLOG"; fails=$((fails+1)); }
 grep -q "relaunching" "$R/rmweb.log" || { echo "  FAIL: no relaunch note in log"; fails=$((fails+1)); }
 
-echo "case 12: a restart loop is bounded and still restores xochitl"
+echo "case 12: a RAPID restart loop gives up after 3 quick relaunches and still restores xochitl"
 setup; APP_MODE=restart-loop PATH="$STUBS:$PATH" RMWEB_ROOT="$R" XOCHITL_ACTIVE=1 sh "$LAUNCHER"
-runs=$(cat "$R/.runs"); [ "$runs" = 6 ] || { echo "  FAIL: expected 6 app runs (1 + 5 relaunches), got $runs"; fails=$((fails+1)); }
+runs=$(cat "$R/.runs"); [ "$runs" = 4 ] || { echo "  FAIL: expected 4 app runs (1 + 3 rapid relaunches), got $runs"; fails=$((fails+1)); }
 want "systemctl start xochitl"
+grep -q "rapid relaunches" "$R/rmweb.log" || { echo "  FAIL: no give-up note"; fails=$((fails+1)); }
 [ -d "$R/.lock" ] && { echo "  FAIL: lock not released"; fails=$((fails+1)); }
+
+echo "case 13: non-rapid rotations are unlimited (7 relaunches with RMWEB_RELAUNCH_MIN_S=0)"
+setup; APP_MODE=restart-7 PATH="$STUBS:$PATH" RMWEB_ROOT="$R" XOCHITL_ACTIVE=1 RMWEB_RELAUNCH_MIN_S=0 sh "$LAUNCHER"
+runs=$(cat "$R/.runs"); [ "$runs" = 8 ] || { echo "  FAIL: expected 8 app runs, got $runs"; fails=$((fails+1)); }
+[ "$(grep -c "systemctl start xochitl" "$STUBLOG")" = 1 ] || { echo "  FAIL: xochitl restarted mid-session"; cat "$STUBLOG"; fails=$((fails+1)); }
 
 if [ "$fails" = 0 ]; then echo "launcher_test: OK"; else echo "launcher_test: $fails FAIL"; exit 1; fi

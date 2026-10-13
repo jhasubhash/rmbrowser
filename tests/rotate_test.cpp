@@ -21,11 +21,35 @@ int main() {
     // parsing / cycle / labels
     CHECK(parseRotation("0") == 0 && parseRotation("90") == 90 && parseRotation("270") == 270);
     CHECK(parseRotation("landscape") == 90 && parseRotation("landscape-flipped") == 270);
-    CHECK(parseRotation("180") == -1 && parseRotation("") == -1 && parseRotation("x") == -1);
-    CHECK(nextRotation(0) == 90 && nextRotation(90) == 270 && nextRotation(270) == 0);
+    CHECK(parseRotation("180") == -2 && parseRotation("") == -2 && parseRotation("x") == -2);
+    CHECK(parseRotation("auto") == kRotateAuto);
+    // cycle: auto -> portrait -> landscape -> flipped -> auto
+    CHECK(nextRotation(kRotateAuto) == 0 && nextRotation(0) == 90 && nextRotation(90) == 270
+          && nextRotation(270) == kRotateAuto);
     CHECK(nextRotation(45) == 90);                        // garbage normalizes to portrait first
     CHECK(normalizeRotation(180) == 0 && normalizeRotation(-90) == 0);
+    CHECK(normalizeRotationSetting(-1) == kRotateAuto && normalizeRotationSetting(180) == 0);
     CHECK(std::string(rotationLabel(90)) == "landscape");
+    CHECK(std::string(rotationLabel(kRotateAuto)).rfind("auto", 0) == 0);
+
+    // mount matrix parse (the Paper Pro's lis2dw12 string) + malformed input
+    double m[9];
+    CHECK(parseMountMatrix("0, 1, 0; 1, 0, 0; 0, 0, -1", m));
+    CHECK(m[0] == 0 && m[1] == 1 && m[3] == 1 && m[8] == -1);
+    CHECK(parseMountMatrix("0.5, -0.5, 0; 0.5, 0.5, 0; 0, 0, 1", m) && m[1] == -0.5);
+    CHECK(!parseMountMatrix("0, 1, 0; 1, 0", m) && !parseMountMatrix("", m));
+
+    // orientation classifier (device frame: x right edge, y top edge, z toward the reader)
+    CHECK(classifyOrientation(0, 1000, 300) == 0);         // upright, leaning back
+    CHECK(classifyOrientation(1000, 0, 300) == 90);        // right edge on top
+    CHECK(classifyOrientation(-1000, 0, 300) == 270);      // left edge on top
+    CHECK(classifyOrientation(0, -1000, 0) == -1);         // upside-down: no 180° mode
+    CHECK(classifyOrientation(100, 100, 1000) == -1);      // lying flat on a table
+    CHECK(classifyOrientation(700, 700, 200) == -1);       // diagonal dead band (hysteresis)
+    CHECK(classifyOrientation(0, 0, 0) == -1);
+    // the device's real reading on 2026-10-13 (raw x=100 y=14612 z=-7844, mount matrix above):
+    // device = M*raw = (14612, 100, 7844) -> right edge on top, propped on a stand
+    CHECK(classifyOrientation(14612, 100, 7844) == 90);
 
     // logical size
     int lw, lh;

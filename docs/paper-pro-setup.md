@@ -63,9 +63,12 @@ What `all` does, in order:
 - Connect to Wi-Fi in the normal reMarkable settings.
 - Open AppLoad from the sidebar, then tap **rmweb**. The browser stops xochitl and takes the panel.
 - Tap **⏻** twice to quit. xochitl comes back with xovi.
-- **Landscape** (this fork): start page → Open settings → Display → *Screen orientation* cycles
-  portrait → landscape (right edge on top) → landscape flipped (left edge on top). The browser
-  restarts into the new orientation within a couple of seconds and remembers it.
+- **Rotation** (this fork): by default the browser follows the tablet. Turn it, hold still for
+  about a second, and it restarts into the new orientation on the same page. It doesn't rotate
+  while you type, lie it flat, or hold it upside-down, or if rotation is locked in the
+  reMarkable's quick settings. Start page → Open settings → Display → *Screen orientation* cycles
+  auto → portrait → landscape (right edge on top) → landscape flipped (left edge on top) to pin
+  one instead.
 - **After a reboot** xovi is off (it's tethered by design). Triple-press the power button to bring
   AppLoad back.
 

@@ -217,8 +217,9 @@ inline std::string buildSettingsPage(const Settings& s) {
     };
     h += "<h2>Display</h2>";
     row(icon::rotateSquare, "rmweb:rotate-next", "Screen orientation", rotationLabel(s.rotate));
-    h += "<div class='hint'>Landscape: turn the tablet so its right edge is on top (flipped: left edge). "
-         "The browser restarts to apply it.</div>";
+    h += "<div class='hint'>Auto turns the page when you turn the tablet (about a second after you "
+         "settle; not while typing or lying flat), unless rotation is locked in the reMarkable's quick "
+         "settings. The browser restarts to rotate and reopens your page.</div>";
     h += "<h2>Reading</h2>";
     row(icon::sunMoon, "rmweb:toggle-dark", "Reader theme", s.readerDark ? "dark" : "light");
     h += "<div class='hint'>Font size: the A- / A+ buttons while reading.</div>";

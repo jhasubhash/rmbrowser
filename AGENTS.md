@@ -147,8 +147,26 @@ at the panel.
      cases 11–12).
    - Not yet verified: a real finger on the rotated glass. Synthetic taps go through the router
      *after* the mapping, so `physToLogical` on device is covered only by the unit test.
-2. **Follow the tablet's orientation automatically**: read xochitl's own orientation or the
-   accelerometer instead of the manual setting.
+2. ✅ **Auto-rotation** (0.9.7-fork.3, device-verified 2026-10-13: user-held rotations
+   90→270→0→90, each resumed the same page).
+   - Setting `rotate=-1` (auto) is the default; the cycle is auto → portrait → landscape →
+     flipped.
+   - Sensor: lis2dw12 via IIO sysfs (`in_accel_{x,y,z}_raw` + `in_accel_mount_matrix` → device
+     frame); `rmweb::classifyOrientation` has a 30° flat cut-off, no 180° mode, and a diagonal dead
+     band as hysteresis.
+   - **sysfs reads block**: one one-shot measurement per read, about 670 ms/axis at the stock
+     12 Hz. So the app sets 50 Hz, and `device/rmweb` restores the original rate on exit. Polling
+     runs on a detached thread every 400 ms; the GUI rotates after 3 equal decisions in a row, and
+     never while editing.
+   - Rotation = exit 75 + relaunch. `resume.txt` (one-shot, <120 s old, http(s) only) reopens the
+     page, and per-URL scroll restore does the rest. `orientation.txt` holds the last orientation
+     (used when the tablet is flat at startup). xochitl's `OrientationLocked=true` disables auto.
+   - The launcher allows unlimited rotations; only runs shorter than `RMWEB_RELAUNCH_MIN_S` (10 s)
+     count, and it gives up after 3 in a row.
+   - A first attempt read the sensor on the GUI thread and produced phantom rotations from a
+     stationary tablet, with no recorded vector. The thread + 50 Hz path hasn't reproduced them.
+     `[rotate] sensor (x, y, z) -> o` lines log every decision change.
+   - Next: rotate live without restarting (resize the viewport, rebuild keyboard/zones).
 3. Merge upstream releases: `git fetch upstream && git merge upstream/master`.
 
 ## Working agreement

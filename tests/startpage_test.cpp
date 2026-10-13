@@ -77,7 +77,7 @@ int main() {
     Settings sar; sar.autoRefreshSec = -1;
     CHECK(has(buildSettingsPage(sar), "blocked (never)")); // auto-refresh cycle label
     CHECK(has(sp, "rmweb:home"));                         // back link to the start page
-    CHECK(has(sp, "rmweb:rotate-next") && has(sp, "portrait"));   // orientation row, default portrait
+    CHECK(has(sp, "rmweb:rotate-next") && has(sp, "auto (follows the tablet)"));   // orientation row, default auto
     Settings srot; srot.rotate = 270;
     CHECK(has(buildSettingsPage(srot), "landscape (flipped)"));
 
