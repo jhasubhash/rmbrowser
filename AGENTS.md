@@ -130,6 +130,22 @@ at the panel.
   - Pages that shift after first paint (late JS layout changes) re-push every text pixel with
     the fast waveform, which underdraws black, so the final render looked paler than the first.
     The settle flash (one full develop once quiet) now also fixes this in B&W mode.
+- **Single-push B&W presents via a QPA interposer** (fork.7, user-verified 2026-10-13).
+  - libqsgepaper presents every frame through
+    `EPFramebuffer::swapBuffers(const QRegion&, const EPScreenModeMap&, QFlags)` via its PLT.
+    `rmweb-wpeqt` (`-rdynamic`) defines that symbol (`rmwebQpaSwapRegion`, `qpa::` namespace), so
+    the QPA's call binds to us. In B&W mode it rewrites the mode map with
+    `EPScreenModeMap::setModeForRegion(region, QualityFast)` and forwards: one push per frame,
+    instead of the QPA's auto-waveform push plus our fast-mono re-push.
+  - `qpa::clipNextPresent(rect)` clips the pushed region while Qt still renders the full frame (not
+    Qt's crash-prone region render). Content-only presents push just the page area, so the toolbar
+    stays still.
+  - The settle develop is limited to the page area (`QualityFull` + NoRefresh): `CompleteRefresh`
+    flashes the whole panel whatever rect it's given.
+  - `getAuxFramebuffer()` is NOT exported on 3.28.0.172 (upstream's research predates that), hence
+    the interposer instead of painting the back buffer.
+  - Levers: `RMWEB_QPA_FORCE=0` (old double push), `RMWEB_QPA_MODE=<0..5>` (forced EPScreenMode,
+    default 1).
 - **"Web fonts" setting** (`webFonts=`, default on) is a separate content filter
   (`kNoFontsRules`) that blocks all font loads. It made no difference on the page that motivated
   it; its benefit is unproven.

@@ -24,6 +24,7 @@
 #include <QPainter>
 #include <QPainterPath>
 #include <QTransform>
+#include <QRegion>
 #include <QPolygonF>
 #include <QElapsedTimer>
 #include <QDir>
@@ -100,6 +101,72 @@ static QTransform logicalToPhysTransform() {
 static QRect logicalRectToPhys(const QRect &r) {
     const rmweb::IRect p = rmweb::logicalRectToPhys(kRotate, kPhysW, kPhysH, {r.x(), r.y(), r.width(), r.height()});
     return QRect(p.x, p.y, p.w, p.h);
+}
+
+// --- Single-push e-ink presents: interpose the QPA's present call -----------------------------------
+// The epaper scenegraph (libqsgepaper, OS 3.28) presents every rendered frame through
+//   EPFramebuffer::swapBuffers(const QRegion&, const EPScreenModeMap&, QFlags<UpdateFlag>)
+// and it calls that through its PLT (R_AARCH64_JUMP_SLOT, verified with readelf on the 3.28.0.172
+// lib). rmweb-wpeqt is linked -rdynamic, so defining the same symbol here makes the dynamic linker bind
+// the QPA's call to US first. With a forced mode set (B&W fast mode) we rewrite the frame's screen-mode
+// map to that one mode (the library's own EPScreenModeMap::setModeForRegion) and forward to the real
+// function: ONE panel push per frame, with our waveform, over exactly the region Qt rendered.
+// Before this, B&W mode pushed every frame TWICE — the QPA's auto-waveform present, then our fast-mono
+// re-push from frameSwapped. On an OS whose symbols differ nothing binds here and the old path runs.
+// rmweb's own swaps (settle flash, clear ghosting, the legacy re-push) call the QRect overload, which
+// forwards into this one: t_ownSwap passes them through untouched.
+namespace qpa {
+using SwapRegionFn = unsigned long (*)(void *self, const QRegion *region, const void *modeMap, int flags);
+using SetModeFn = void (*)(void *modeMap, const QRegion *region, int mode);
+static SwapRegionFn g_real = nullptr;
+static SetModeFn g_setMode = nullptr;
+static std::atomic<int> g_forceMode{-1};          // -1: pass through; else EPScreenMode for every QPA present
+static std::atomic<unsigned> g_calls{0};           // QPA presents seen (proves the interposition is live)
+static thread_local bool t_ownSwap = false;
+// One-shot PHYSICAL clip for the next QPA present (GUI thread only: QSG_RENDER_LOOP=basic presents on
+// the GUI thread, and our present gate serializes presents). Qt still renders the full frame through
+// its normal path; only the region handed to the panel shrinks — e.g. a page turn pushes just the
+// page area, not the unchanged toolbar. (Qt's own REGION render is what crashed under storms; this
+// doesn't use it.)
+static QRect g_nextClip;
+static void clipNextPresent(const QRect &phys) { g_nextClip = phys; }
+static const char *kLib = "/usr/lib/plugins/scenegraph/libqsgepaper.so";
+static const char *kSwapRegion =
+    "_ZN13EPFramebuffer11swapBuffersERK7QRegionRK15EPScreenModeMap6QFlagsINS_10UpdateFlagEE";
+static bool resolve() {
+    if (g_real) return true;
+    // The lib is already loaded (we are being called FROM it). dlsym on ITS handle searches the lib
+    // itself first, so this finds the genuine definition, not ours (the executable isn't in its scope).
+    void *h = dlopen(kLib, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) return false;
+    g_real = reinterpret_cast<SwapRegionFn>(dlsym(h, kSwapRegion));
+    g_setMode = reinterpret_cast<SetModeFn>(dlsym(h, "_ZN15EPScreenModeMap16setModeForRegionERK7QRegion12EPScreenMode"));
+    return g_real != nullptr;
+}
+static bool interposed() { return g_calls.load(std::memory_order_relaxed) > 0 && g_setMode; }
+static void setForceMode(int mode) { g_forceMode.store(mode, std::memory_order_relaxed); }
+struct OwnSwap { OwnSwap() { t_ownSwap = true; } ~OwnSwap() { t_ownSwap = false; } };
+} // namespace qpa
+extern "C" unsigned long rmwebQpaSwapRegion(void *self, const QRegion *region, const void *modeMap, int flags)
+    __asm__("_ZN13EPFramebuffer11swapBuffersERK7QRegionRK15EPScreenModeMap6QFlagsINS_10UpdateFlagEE");
+extern "C" __attribute__((visibility("default")))
+unsigned long rmwebQpaSwapRegion(void *self, const QRegion *region, const void *modeMap, int flags) {
+    if (!qpa::resolve()) {   // can't happen once the lib is loaded; never leave the panel un-presented silently
+        qWarning("[qpa] cannot resolve the real swapBuffers — present dropped");
+        return 0;
+    }
+    if (qpa::g_calls.fetch_add(1, std::memory_order_relaxed) == 0)
+        qInfo("[qpa] present interposed (setModeForRegion %s)", qpa::g_setMode ? "found" : "MISSING");
+    QRegion clipped;
+    if (!qpa::t_ownSwap && !qpa::g_nextClip.isNull() && region) {
+        clipped = region->intersected(qpa::g_nextClip);
+        region = &clipped;
+    }
+    qpa::g_nextClip = QRect();
+    const int mode = qpa::g_forceMode.load(std::memory_order_relaxed);
+    if (mode >= 0 && !qpa::t_ownSwap && qpa::g_setMode && region)
+        qpa::g_setMode(const_cast<void *>(modeMap), region, mode);
+    return qpa::g_real(self, region, modeMap, flags);
 }
 
 // --- Auto-rotation: the accelerometer via IIO sysfs (Paper Pro: lis2dw12_accel, ~12 Hz) ---------
@@ -2358,7 +2425,8 @@ private:
 // ---------------------------------------------------------------------------
 class EpaperRefresh;   // defined further below — WpeView calls its presentFast in B&W mode
 void epdPresentFastIfOk(EpaperRefresh *e, const QRect &r);   // thin call wrapper (complete type only below)
-void epdFullSwapIfOk(EpaperRefresh *e);      // same wrapper for the RMWEB_FULL_PRESENT diagnostic
+void epdFullSwapIfOk(EpaperRefresh *e, const QRect &physArea = QRect());   // full develop (null = whole panel)
+void epdAntiGhostIfOk(EpaperRefresh *e);     // single-push B&W: count a fast present, flash every Nth
 
 class WpeView : public QQuickPaintedItem {
     Q_OBJECT
@@ -2406,8 +2474,8 @@ public:
             // the first — one full develop once the page is quiet restores it.
             if (m_editing || !m_epd || !m_settleOn || m_exiting) return;   // no flash while typing / off / exiting
             if (m_inFlight) { m_settleFlash.start(500); return; }   // present still on the panel — retry
-            qCDebug(lcEngine, "[t][gui] settle flash (full develop)");
-            manualFullSwap();
+            qCDebug(lcEngine, "[t][gui] settle flash (%s)", singlePush() ? "page area" : "full develop");
+            manualFullSwap(singlePush() ? logicalRectToPhys(pageArea()) : QRect());
         });
         rebuildKeys();   // URL keyboard, drawn into the frame (B2)
         // Keyboard: buffer keystrokes, paint once after a short idle (e-ink can't keep up with per-key presents).
@@ -2839,7 +2907,17 @@ public Q_SLOTS:
     // B&W fast mode (settings page): present grayscale frames — the panel's fast mono waveform develops
     // them fully, while colour content under a fast waveform stays washed out until a slow full pass.
     // And force that fast waveform ourselves per content present (presentFast below).
-    void setBwFast(bool v)         { if (v != m_bwFast) { m_bwFast = v; m_grayDirty = true; markDirtyAll(); schedule(); } }
+    void setBwFast(bool v) {
+        if (v == m_bwFast) return;
+        m_bwFast = v; m_grayDirty = true;
+        // Single-push B&W: every QPA present goes out with the fast mono waveform (QualityFast=1) via
+        // the swapBuffers interposer. RMWEB_QPA_FORCE=0 falls back to the old double push.
+        static const bool force = qgetenv("RMWEB_QPA_FORCE") != "0";
+        static const int mode = qEnvironmentVariableIsSet("RMWEB_QPA_MODE")
+                                    ? qBound(0, qEnvironmentVariableIntValue("RMWEB_QPA_MODE"), 5) : 1;
+        qpa::setForceMode(v && force ? mode : -1);
+        markDirtyAll(); schedule();
+    }
     // Text boost (colour mode): darken text via a luma tone curve on the frame (paint() below).
     void setTextBoost(bool v)      { if (v != m_textBoost) { m_textBoost = v; m_tonedDirty = true; markDirtyAll(); schedule(); } }
     // Settle flash (settings page): one full-quality develop after the page goes quiet. No repaint
@@ -2898,8 +2976,14 @@ private Q_SLOTS:
         // (single-threaded, GUI-thread rendering): frameSwapped then fires after the QPA's present
         // returned (its fb mutex is free), and +0 ms puts us fully outside the render-loop tick.
         // main() refuses to wire this path (m_epd stays null) under any other render loop.
-        if (m_bwFast && hadContent && m_epd)
-            QTimer::singleShot(0, this, [this, presentRect]{ epdPresentFastIfOk(m_epd, presentRect); });
+        // With the interposer live the QPA's present already WAS the fast mono push — just keep the
+        // periodic anti-ghost flash cadence; otherwise (old OS / RMWEB_QPA_FORCE=0) re-push as before.
+        if (m_bwFast && hadContent && m_epd) {
+            if (qpa::interposed() && qpa::g_forceMode.load() >= 0)
+                QTimer::singleShot(0, this, [this]{ epdAntiGhostIfOk(m_epd); });
+            else
+                QTimer::singleShot(0, this, [this, presentRect]{ epdPresentFastIfOk(m_epd, presentRect); });
+        }
         // Re-arm the settle flash on every content present; it fires once the page goes quiet.
         if (hadContent && m_settleOn && m_settleFullMs > 0) m_settleFlash.start(m_settleFullMs);
         // Diagnostic: RMWEB_FULL_PRESENT=1 re-pushes every content frame with the FULL colour waveform
@@ -3197,10 +3281,10 @@ private:
     // blank touch around the waveform (it induces phantom taps), and arm the present gate by hand —
     // a manual swap gets no frameSwapped, so without this the serializer's invariant (m_inFlight ⟺
     // a present is on the panel) would break, and the exit drain couldn't wait it out.
-    void manualFullSwap() {
+    void manualFullSwap(const QRect &physArea = QRect()) {   // null = the whole panel
         bumpTouchGuard();
         m_clock.restart();   // honest dwell accounting if a real frameSwapped follows the flash
-        epdFullSwapIfOk(m_epd);
+        epdFullSwapIfOk(m_epd, physArea);
         bumpTouchGuard();
         m_inFlight = true;
         m_fallback.start(kFallbackMs);
@@ -3287,6 +3371,11 @@ private:
         return r;
     }
     static QRect barZone()    { return QRect(0, 0, kPanelW, kBarH()); }                   // chrome bar
+    // The web page's on-screen area: everything below the toolbar (the whole panel when it's hidden).
+    QRect pageArea() const { return m_chromeOn ? QRect(0, kBarH(), kPanelW, kPanelH - kBarH())
+                                               : QRect(0, 0, kPanelW, kPanelH); }
+    // B&W fast mode with the QPA interposer live: one push per frame, our waveform, our region.
+    bool singlePush() const { return m_bwFast && qpa::interposed() && qpa::g_forceMode.load() >= 0; }
     static QRect pillZone()   { return QRect(0, kBarH(), kPanelW, 270); }               // badges + notice toast
     static QRect noticeZone() { return QRect(0, int(kPanelH * 0.30), kPanelW, 270); } // render-failed notice (drawRenderNotice)
     static QRect kbZone()     { return QRect(0, editTopY(), kPanelW, kPanelH - editTopY()); } // echo field + keyboard
@@ -3342,6 +3431,17 @@ private:
             update(phys);                        // -> scene render of the region -> EPRenderLoop
         } else {                                 // pushes exactly it to the panel
             m_lastPresentRect = QRect(0, 0, kPhysW, kPhysH);
+            // Single-push B&W: a content-only present (toolbar unchanged) goes to the panel as the
+            // PAGE AREA only — the scene still renders in full (safe path), the interposer clips
+            // what is pushed, so the toolbar doesn't redraw on every page turn.
+            const QRect page = pageArea();
+            if (hadContent && singlePush() && page != QRect(0, 0, kPanelW, kPanelH)
+                    && !dirty.intersects(barZone())) {
+                m_lastPresentRect = logicalRectToPhys(page);
+                qpa::clipNextPresent(m_lastPresentRect);
+                qCDebug(lcEngine, "[t][gui] present page area %dx%d@%d,%d", m_lastPresentRect.width(),
+                        m_lastPresentRect.height(), m_lastPresentRect.x(), m_lastPresentRect.y());
+            }
             update();                            // -> scene render -> EPRenderLoop present to panel
         }
         m_fallback.start(kFallbackMs);
@@ -3666,6 +3766,12 @@ public:
             swap(r, 0, 1, 0);                                 // Mono, QualityFast, NoRefresh
         }
     }
+    // Single-push B&W mode (QPA interposer live): the content present itself was the fast mono push;
+    // only the anti-ghost cadence of presentFast() remains — a full flash every m_fastFullEvery.
+    void antiGhostTick() {
+        if (!m_fb) return;
+        if (++m_fastFrames >= m_fastFullEvery) { m_fastFrames = 0; fullSwap(); }
+    }
     // Present what the scenegraph just rendered. Enum values: EPContentType{Mono=0,Color=1} (legacy ABI),
     // EPScreenMode{QualityFast=1,QualityFull=4}, UpdateFlag{NoRefresh=0,CompleteRefresh=1}.
     void present() {
@@ -3687,11 +3793,18 @@ public:
     }
     // One full-quality flash: develops colour and clears accumulated ghosting. Shared by present()'s
     // colour cadence and presentFast()'s anti-ghost cadence. public for the RMWEB_FULL_PRESENT diagnostic.
-    void fullSwap() { swap(QRect(0, 0, kPhysW, kPhysH), 1, 4, 1); }   // Color, QualityFull, CompleteRefresh
+    // physArea null: the classic whole-panel develop (QualityFull + CompleteRefresh). A rect: QualityFull
+    // WITHOUT CompleteRefresh over just that area — device-verified 2026-10-13 that CompleteRefresh
+    // flashes the WHOLE panel whatever rect it is given (the toolbar flashed with a page-area develop).
+    void fullSwap(const QRect &physArea = QRect()) {
+        if (physArea.isNull()) swap(QRect(0, 0, kPhysW, kPhysH), 1, 4, 1);   // Color, QualityFull, CompleteRefresh
+        else                   swap(physArea, 1, 4, 0);                       // QualityFull, NoRefresh, area only
+    }
 private:
     // swap dispatch: current ABI (QRect, mode, flags) vs legacy (QRect, contentType, mode, flags).
     // The legacy ABI takes the content type — pass it through (a full flash is Color, not Mono).
     void swap(const QRect &r, int contentType, int mode, int flags) {
+        const qpa::OwnSwap own;   // our explicit waveform choice: the QPA interposer must not rewrite it
         blockSigterm(true);   // vendor ioctl must not take a signal mid-update
         if (m_swap) m_swap(m_fb, r, mode, flags);
         else m_swapLegacy(m_fb, r, contentType, mode, flags);
@@ -3714,7 +3827,8 @@ private:
 };
 
 void epdPresentFastIfOk(EpaperRefresh *e, const QRect &r) { if (e && e->ok()) e->presentFast(r); }
-void epdFullSwapIfOk(EpaperRefresh *e)  { if (e && e->ok()) e->fullSwap(); }
+void epdFullSwapIfOk(EpaperRefresh *e, const QRect &physArea) { if (e && e->ok()) e->fullSwap(physArea); }
+void epdAntiGhostIfOk(EpaperRefresh *e) { if (e && e->ok()) e->antiGhostTick(); }
 
 // Reading-shell host: a bare full-screen Window holding the WpeView. The browser chrome is hand-painted
 // INTO the WpeView frame (the "B2" approach) — a QtQuick toolbar does NOT composite under the epaper QPA, so
