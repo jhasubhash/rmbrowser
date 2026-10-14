@@ -29,6 +29,8 @@ struct Settings { double zoom = 0.5; int readerFont = 30; std::string ua; bool r
                                             // 0: guard off (allow all); -1: block all auto-refreshes
                   bool webFonts = true;     // false: block all downloadable fonts (one render, darker
                                             // device fonts on e-ink; icon fonts degrade)
+                  bool sleepPage = true;    // standby keeps the current page on the panel (+ a small
+                                            // "Sleeping" note); false: the stock suspended.png
                   int rotate = -1;          // screen orientation: -1 auto (accelerometer, default),
                                             // 0 portrait, 90 landscape, 270 landscape (flipped)
                                             // — rotate.h; read at startup
@@ -318,6 +320,7 @@ inline Settings loadSettings(const std::string& dir) {
         else if (k == "autoRefreshSec") s.autoRefreshSec = std::atoi(v.c_str());
         else if (k == "rotate") s.rotate = std::atoi(v.c_str());
         else if (k == "webFonts") s.webFonts = (v != "0");     // default ON: absent/corrupt stays true
+        else if (k == "sleepPage") s.sleepPage = (v != "0");   // default ON: same rule
     }
     if (s.rotate != -1 && s.rotate != 0 && s.rotate != 90 && s.rotate != 270) s.rotate = -1;   // invalid -> auto
     if (!(s.zoom >= 0.5 && s.zoom <= 3.0)) s.zoom = 0.5;                 // clamp corrupt values (0.5 = the default)
@@ -342,7 +345,8 @@ inline bool saveSettings(const std::string& dir, const Settings& s) {
                     + "settleFlash=" + std::string(s.settleFlash ? "1" : "0") + "\n"
                     + "autoRefreshSec=" + std::to_string(s.autoRefreshSec) + "\n"
                     + "rotate=" + std::to_string(s.rotate) + "\n"
-                    + "webFonts=" + std::string(s.webFonts ? "1" : "0") + "\n";
+                    + "webFonts=" + std::string(s.webFonts ? "1" : "0") + "\n"
+                    + "sleepPage=" + std::string(s.sleepPage ? "1" : "0") + "\n";
     return detail::atomicWrite(dir + "/settings.txt", out);
 }
 

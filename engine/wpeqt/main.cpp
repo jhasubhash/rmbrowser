@@ -250,6 +250,136 @@ static bool touchGuarded()  { return g_get_monotonic_time() < g_touchGuardUntilU
 // 250 ms debounce would eat fast typing). Set only from the GUI thread; read from the touch thread.
 static std::atomic<bool> g_urlEditing{false};
 
+// Standby. The stock OS turns kernel autosleep on (remarkable-enable-slumber: /sys/power/autosleep =
+// mem), and xochitl holds a wake lock (libcslpower: /sys/power/wake_lock) while it's awake. We stop
+// xochitl, so with no lock of our own the kernel suspends between touches on battery (dmesg
+// 2026-10-14: "suspend entry" about once a second, woken by Wi-Fi / touch IRQs). Hold "rmweb" while
+// awake; standby releases it right before sleepUntilWake suspends the tablet. The launcher
+// releases it on exit too (a crash must not keep the tablet awake forever).
+static std::atomic<bool> g_asleep{false};   // standby: sleep screen up (PowerReader re-takes the lock)
+static void setWakeLock(bool hold) {
+    const char *path = hold ? "/sys/power/wake_lock" : "/sys/power/wake_unlock";
+    const int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) { qWarning("[power] open %s: %s", path, strerror(errno)); return; }
+    if (write(fd, "rmweb", 5) < 0) qWarning("[power] write %s: %s", path, strerror(errno));
+    close(fd);
+}
+
+static int openInputByName(const char *want);
+// Kernel wakeup-source counters by name (/sys/class/wakeup/wakeupN/name). -1 = not found.
+static long wakeupStat(const char *source, const char *field) {
+    DIR *dir = opendir("/sys/class/wakeup");
+    if (!dir) return -1;
+    long v = -1;
+    struct dirent *e;
+    while ((e = readdir(dir))) {
+        if (e->d_name[0] == '.') continue;
+        const std::string base = std::string("/sys/class/wakeup/") + e->d_name + "/";
+        std::string name;
+        if (!readSysfsLine(base + "name", name) || name != source) continue;
+        std::string val;
+        if (readSysfsLine(base + field, val)) v = std::atol(val.c_str());
+        break;
+    }
+    closedir(dir);
+    return v;
+}
+// IRQ number of the /proc/interrupts line whose name contains `name`; -1 = not found.
+static int irqByName(const char *name) {
+    FILE *f = fopen("/proc/interrupts", "re");
+    if (!f) return -1;
+    char line[512]; int irq = -1;
+    while (fgets(line, sizeof line, f))
+        if (strstr(line, name)) { irq = std::atoi(line); break; }
+    fclose(f);
+    return irq;
+}
+static long sysfsLong(const char *path) { std::string s; return readSysfsLine(path, s) ? std::atol(s.c_str()) : -1; }
+static void writeSysfs(const char *path, const char *v) {
+    const int fd = open(path, O_WRONLY | O_CLOEXEC);
+    if (fd < 0) return;
+    if (write(fd, v, strlen(v)) < 0) qWarning("[power] write %s: %s", path, strerror(errno));
+    close(fd);
+}
+static std::mutex g_sleepMu;                 // one suspend loop at a time
+static std::atomic<int> g_sleepGen{0};       // bumped on every wake: a stale loop sees it and bails
+// Suspend the way xochitl does (`systemctl suspend`): the stock system-sleep hooks take Wi-Fi/BT
+// down and limit wakeups to /etc/pm/sleep.wakesrc (power key, RTC, folio, charger), so the tablet
+// really sleeps. Kernel autosleep alone woke it ~1/s on Wi-Fi IRQs (dmesg 2026-10-14).
+//  - First wait for the EPD PMIC (wakeup source "1-0048") to drop its rails: they stay on ~30 s
+//    after the last panel update (xochitl delays suspend ~23 s for the same reason).
+//  - Autosleep goes off BEFORE our lock is released: otherwise it suspends in the gap before the
+//    hook gets to it, with Wi-Fi still up (seen on device). It's back on (mem) after a real wake.
+//  - `systemctl suspend` only queues the job: the resume is detected by suspend_stats/success.
+//  - The wake reason is /sys/power/pm_wakeup_irq (the snvs-powerkey wakeup source never counts
+//    events). Power key / folio opened -> return it; anything else (RTC, charger) -> sleep again.
+// Returns nullptr when a wake from elsewhere (gen bumped) cancelled the loop. Blocks: own thread.
+static const char *sleepUntilWake(int gen) {
+    std::lock_guard<std::mutex> lk(g_sleepMu);
+    auto cancelled = [gen]{ return g_sleepGen.load() != gen || !g_asleep.load(); };
+    auto cancel = []() -> const char * { writeSysfs("/sys/power/autosleep", "mem"); return nullptr; };
+    for (int i = 0; i < 90 && wakeupStat("1-0048", "active_time_ms") > 0; ++i) {   // <= 45 s
+        if (cancelled()) return nullptr;
+        g_usleep(500000);
+    }
+    static const int keyIrq = irqByName("snvs-powerkey"), folioIrq = irqByName("Folio sensor");
+    for (int attempt = 1; ; ++attempt) {
+        if (cancelled()) return cancel();
+        writeSysfs("/sys/power/autosleep", "off");
+        setWakeLock(false);
+        const long ok0 = sysfsLong("/sys/power/suspend_stats/success");
+        const long fail0 = sysfsLong("/sys/power/suspend_stats/fail");
+        qInfo("[standby] suspending (attempt %d)", attempt);
+        const int rc = std::system("systemctl suspend");
+        // Wait for the resume (our thread is frozen while suspended; it resumes past the sleep),
+        // or the abort (suspend_stats/fail), or 15 s for a job that never ran.
+        bool slept = false, failed = false;
+        for (int i = 0; i < 60 && !slept && !failed; ++i) {
+            g_usleep(250000);
+            slept = sysfsLong("/sys/power/suspend_stats/success") > ok0;
+            failed = sysfsLong("/sys/power/suspend_stats/fail") > fail0;
+        }
+        const long irq = sysfsLong("/sys/power/pm_wakeup_irq");
+        qInfo("[standby] %s rc=%d wake irq=%ld", slept ? "resumed" : failed ? "suspend aborted" : "no suspend", rc, irq);
+        if (slept && irq == keyIrq) return "power key";
+        if (slept && irq == folioIrq) {
+            // The folio moved: wake only if it's open now (SW_LID clear); unknown counts as open.
+            const int fd = openInputByName("Hall effect sensors");
+            unsigned long sw[(SW_MAX + 1 + 8 * sizeof(long) - 1) / (8 * sizeof(long))] = {};
+            const bool known = fd >= 0 && ioctl(fd, EVIOCGSW(sizeof sw), sw) >= 0;
+            if (fd >= 0) close(fd);
+            if (!known || !(sw[SW_LID / (8 * sizeof(long))] & (1UL << (SW_LID % (8 * sizeof(long))))))
+                return "cover opened";
+        }
+        // Not a wake for us. After a real resume (RTC, charger) the stock hook holds "sleep.resume"
+        // for 8 s, which aborts a suspend attempted sooner — wait it out. An aborted attempt (the
+        // first one after awake time usually is: "tasks refusing to freeze", a wakeup event still
+        // pending) retries after a beat: the abort itself cleared the pending check.
+        for (int i = 0, n = slept ? 40 : 8; i < n; ++i) {
+            if (cancelled()) return cancel();
+            g_usleep(250000);
+        }
+    }
+}
+
+// Find an evdev node by its EVIOCGNAME (node numbers aren't stable across devices/OS builds).
+static int openInputByName(const char *want) {
+    DIR *dir = opendir("/dev/input");
+    if (!dir) return -1;
+    struct dirent *e; char path[320], name[256]; int found = -1;  /* path: "/dev/input/" + d_name(255) + NUL */
+    while ((e = readdir(dir))) {
+        if (strncmp(e->d_name, "event", 5) != 0) continue;
+        snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) continue;
+        name[0] = 0;
+        if (ioctl(fd, EVIOCGNAME(sizeof name), name) >= 0 && strcmp(name, want) == 0) { found = fd; break; }
+        close(fd);
+    }
+    closedir(dir);
+    return found;
+}
+
 // Print a native backtrace on a fatal signal (straight to fd 2 -> the persistent device log), then
 // re-raise so the watchdog still sees the crash. Our binary is unstripped, so addr2line on
 // build/rmweb-wpeqt resolves the rmweb frames.
@@ -463,6 +593,7 @@ Q_SIGNALS:
     void bwFastChanged(bool on);                   // settings-page B&W fast mode toggle -> view render path
     void textBoostChanged(bool on);                // settings-page text darkening toggle -> view render path
     void settleFlashChanged(bool on);              // settings-page settle-flash toggle -> view panel path
+    void sleepPageChanged(bool on);                // settings-page sleep-screen toggle -> view standby paint
     void linkMissed();                             // a content tap hit no link -> GUI falls back to chrome toggle
     void bookmarkedChanged(bool on);               // current page bookmark state changed
     void notice(const QString &text);              // transient toast in the chrome (find results, downloads)
@@ -497,6 +628,7 @@ public Q_SLOTS:
                                                    // m_settings from main() (that runs before start).
         Q_EMIT textBoostChanged(m_settings.textBoost);   // same delivery path as bwFastChanged
         Q_EMIT settleFlashChanged(m_settings.settleFlash);   // same delivery path again
+        Q_EMIT sleepPageChanged(m_settings.sleepPage);
         // RMWEB_READER_FONT env wins over persisted value (same guard as ctor, re-applied after settings load).
         if (const char *e = getenv("RMWEB_READER_FONT")) { const int v = atoi(e); if (v >= 14 && v <= 96) m_readerFont = v; }
 
@@ -690,6 +822,12 @@ public Q_SLOTS:
                         done();
                     } else if (cmd == "toggle-settleflash") {
                         self->toggleSettleFlashSetting();
+                        done();
+                    } else if (cmd == "toggle-sleeppage") {
+                        self->m_settings.sleepPage = !self->m_settings.sleepPage;
+                        rmweb::saveSettings(self->m_profileDir, self->m_settings);
+                        qInfo("[standby] sleep screen: %s (settings)", self->m_settings.sleepPage ? "page" : "reMarkable");
+                        Q_EMIT self->sleepPageChanged(self->m_settings.sleepPage);
                         done();
                     } else if (cmd == "toggle-block") {
                         self->toggleBlockSetting();
@@ -2472,7 +2610,7 @@ public:
             // Also in B&W fast mode: its fast mono updates underdrive black when a page REDRAWS over
             // itself (late layout shifts re-push every text pixel), leaving the final render paler than
             // the first — one full develop once the page is quiet restores it.
-            if (m_editing || !m_epd || !m_settleOn || m_exiting) return;   // no flash while typing / off / exiting
+            if (m_editing || !m_epd || !m_settleOn || m_exiting || m_standby != Awake) return;   // no flash while typing / off / exiting / asleep
             // Single-push B&W already presents with a deep waveform (Quality3) — nothing left to develop.
             // RMWEB_QPA_MODE=1 (fast) brings the page-area settle develop back for that variant.
             static const bool fastVariant = qEnvironmentVariableIntValue("RMWEB_QPA_MODE") == 1;
@@ -2531,11 +2669,44 @@ public:
         // EPDC finishes a commanded waveform autonomously regardless.
         g_usleep((guint)m_dwellMs * 1000 + 300000);   // dwell + physical tail margin
     }
+    // Standby: draw the sleep screen, develop it with one full refresh, wait out the waveform, then
+    // emit readyToSleep (main() releases the wake lock and the kernel suspends). Presents stay
+    // blocked until exitStandby, so WebKit frames that arrive meanwhile (JS timers during brief
+    // Wi-Fi wakeups) only update m_img — they never reach the panel or keep the tablet awake.
+    // Each step waits for the present gate: never overlap a present (see the class comment).
+    bool inStandby() const { return m_standby != Awake; }
+    void enterStandby(const char *why) {
+        if (m_standby != Awake || m_exiting) return;
+        qInfo("[standby] enter (%s)", why);
+        m_standby = Entering; m_standbyStep = 0;
+        m_settleFlash.stop(); m_contentFlush.stop(); m_noticeTimer.stop(); m_notice.clear();
+        if (!m_sleepPage && m_sleepImg.isNull()) {
+            m_sleepImg = QImage(QStringLiteral("/usr/share/remarkable/suspended.png"));
+            if (m_sleepImg.isNull()) qWarning("[standby] no suspended.png — plain sleep screen");
+        }
+        standbyStep();
+    }
+    void exitStandby(const char *why) {
+        if (m_standby == Awake) return;
+        qInfo("[standby] wake (%s)", why);
+        m_standby = Awake;
+        markDirtyAll(); schedule();   // the page back (any frame that arrived while asleep included)
+        if (m_epd && !m_sleepPage) clearGhosting();   // the sleep image ghosts through otherwise
+    }
     void paint(QPainter *p) override {
         // Everything below works in the LOGICAL frame (kPanelW x kPanelH; equals the item size in
         // portrait). In landscape the painter maps logical -> physical, so the chrome/keyboard/badge
         // painters are orientation-agnostic and clipBoundingRect() (the tone passes' row range) comes
         // back in logical coordinates; the page image itself goes through drawContent's pre-rotation.
+        if (m_standby != Awake && !m_sleepPage) { paintSleep(p); return; }
+        const QTransform base = p->transform();
+        paintPage(p);
+        if (m_standby == Awake) return;
+        p->setTransform(base);   // paintPage leaves the logical (maybe rotated) transform behind
+        if (kRotate) p->setTransform(logicalToPhysTransform(), true);
+        drawSleepNote(p);
+    }
+    void paintPage(QPainter *p) {
         const qreal w = kPanelW, h = kPanelH;
         const QTransform base = p->transform();
         if (kRotate) p->setTransform(logicalToPhysTransform(), true);
@@ -2833,13 +3004,14 @@ public:
     }
 Q_SIGNALS:
     void urlEntered(const QString &url);   // Go pressed with a non-empty buffer -> load it (wired in main())
+    void readyToSleep();                   // the sleep screen is on the panel -> main() drops the wake lock
     void fieldTextEntered(const QString &text);   // Go in field mode -> commit into the focused page field
 public Q_SLOTS:
     // "Clear ghosting now" (settings page -> engine signal): one manual full-quality develop, on
     // demand. Retries once the panel is free (a present in flight gets the gate first); the settle
     // flash is stopped — a pending one would be redundant right after this.
     void clearGhosting() {
-        if (!m_epd || m_exiting) return;
+        if (!m_epd || m_exiting || m_standby != Awake) return;
         if (m_inFlight) { QTimer::singleShot(500, this, [this]{ clearGhosting(); }); return; }
         m_settleFlash.stop();
         manualFullSwap();
@@ -2929,6 +3101,7 @@ public Q_SLOTS:
     // Settle flash (settings page): one full-quality develop after the page goes quiet. No repaint
     // needed — it's a panel-side pass; off just stops a pending timer.
     void setSettleFlash(bool v)    { if (v != m_settleOn) { m_settleOn = v; if (!v) m_settleFlash.stop(); } }
+    void setSleepPage(bool v)      { m_sleepPage = v; }   // read at the next standby
     void setEpaperRefresh(EpaperRefresh *e) { m_epd = e; }
     void setCanBack(bool v)        { if (v != m_canBack)  { m_canBack  = v; scheduleDirty(barZone()); } }
     void setCanFwd(bool v)         { if (v != m_canFwd)   { m_canFwd   = v; scheduleDirty(barZone()); } }
@@ -3351,6 +3524,7 @@ private:
     // chrome flushes pass false so typing is not blocked mid-burst.
     void schedule(bool guardTouch = true) {
         if (m_exiting) return;   // draining for exit: no new presents
+        if (m_standby != Awake) { m_dirty = true; return; }   // asleep: exitStandby repaints everything
         m_nextGuardTouch = m_nextGuardTouch || guardTouch;
         if (m_inFlight) m_dirty = true;
         else presentNext();
@@ -3468,9 +3642,64 @@ private:
                 mergeStrip(canvas, s.first, s.second);
         }
         m_stripQueue.clear();
-        if (m_exiting) return;                            // draining for exit: no re-present
+        if (m_exiting || m_standby != Awake) return;      // draining for exit / asleep: no re-present
         if (m_hasPending || m_dirty) presentNext();   // newer frame or a chrome change queued -> present it
     }
+    // Sleep screen: the stock suspended.png (what xochitl shows), in the PHYSICAL frame — it's a
+    // portrait image whatever orientation the browser is in.
+    void paintSleep(QPainter *p) const {
+        p->fillRect(QRectF(0, 0, kPhysW, kPhysH), Qt::white);
+        if (!m_sleepImg.isNull()) {
+            p->drawImage(QRectF(0, 0, kPhysW, kPhysH), m_sleepImg);
+            return;
+        }
+        QFont f = p->font(); f.setPixelSize(56); p->setFont(f);
+        p->setPen(Qt::black);
+        p->drawText(QRectF(0, 0, kPhysW, kPhysH), Qt::AlignCenter,
+                    QStringLiteral("Sleeping\nPress the power button to wake"));
+    }
+    // Page-mode sleep screen: the page stays, with a small note at the bottom (logical frame).
+    void drawSleepNote(QPainter *p) const {
+        QFont f = p->font(); f.setPixelSize(int(34 * uiScale())); p->setFont(f);
+        const QString lbl = QStringLiteral("Sleeping · press the power button to wake");
+        const qreal pad = 28 * uiScale(), bh = 76 * uiScale();
+        const qreal bw = p->fontMetrics().horizontalAdvance(lbl) + 2 * pad;
+        const QRectF r((kPanelW - bw) / 2, kPanelH - bh - 40 * uiScale(), bw, bh);
+        p->setPen(QPen(Qt::black, 3)); p->setBrush(Qt::white);
+        p->drawRoundedRect(r, 18, 18);
+        p->drawText(r, Qt::AlignCenter, lbl);
+    }
+    // enterStandby's sequence, one step per free present gate: 0 sleep screen, 1 full develop,
+    // 2 waveform tail, 3 asleep. A wake in between (m_standby back to Awake) ends it.
+    void standbyStep() {
+        if (m_standby != Entering) return;
+        if (m_inFlight) { QTimer::singleShot(100, this, [this]{ standbyStep(); }); return; }
+        switch (m_standbyStep++) {
+        case 0:   // the sleep screen, through the normal present path (paint() draws it now)
+            markDirtyAll(); m_nextGuardTouch = true;
+            presentNext();
+            QTimer::singleShot(100, this, [this]{ standbyStep(); });
+            return;
+        case 1:   // one full develop: a clean sleep image, no ghost of the page under it
+            if (m_epd) manualFullSwap();
+            QTimer::singleShot(100, this, [this]{ standbyStep(); });
+            return;
+        case 2:   // swapBuffers returns before the full waveform physically ends — let it finish
+            QTimer::singleShot(kSleepTailMs, this, [this]{ standbyStep(); });
+            return;
+        default:
+            m_standby = Asleep;
+            qInfo("[standby] sleep screen up");
+            Q_EMIT readyToSleep();
+            return;
+        }
+    }
+    enum Standby { Awake, Entering, Asleep };
+    Standby m_standby = Awake;
+    int m_standbyStep = 0;
+    QImage m_sleepImg;                           // /usr/share/remarkable/suspended.png, loaded on first use
+    bool m_sleepPage = true;                     // settings: sleep screen = this page (vs the stock image)
+    static const int kSleepTailMs = 1500;        // full-waveform tail before the kernel may suspend
     static const int kFallbackMs = 2500;         // release even if frameSwapped never fires (>= worst refresh)
     static const int kKbFlushMs = 120;           // coalesce keystrokes; one e-ink paint after typing pause
     int m_dwellMs = 200;                         // min present spacing, ms (RMWEB_PRESENT_DWELL overrides)
@@ -3572,7 +3801,7 @@ Q_SIGNALS:
 public Q_SLOTS:
     void run() {
         blockSigterm(true);   // TERM belongs to the GUI thread between presents, not here
-        int fd = openByName("Elan touch input");
+        int fd = openInputByName("Elan touch input");
         if (fd < 0) { qWarning("[touch] 'Elan touch input' node not found"); return; }
         // The grab is NOT optional: without it the epaper QPA's broken touch dispatch reaches
         // WebKit and crashes it (see the class comment). Retry a few times (the launcher may
@@ -3647,22 +3876,6 @@ public Q_SLOTS:
         close(fd);
     }
 private:
-    static int openByName(const char *want) {
-        DIR *dir = opendir("/dev/input");
-        if (!dir) return -1;
-        struct dirent *e; char path[320], name[256]; int found = -1;  /* path: "/dev/input/" + d_name(255) + NUL */
-        while ((e = readdir(dir))) {
-            if (strncmp(e->d_name, "event", 5) != 0) continue;
-            snprintf(path, sizeof path, "/dev/input/%s", e->d_name);
-            int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
-            if (fd < 0) continue;
-            name[0] = 0;
-            if (ioctl(fd, EVIOCGNAME(sizeof name), name) >= 0 && strcmp(name, want) == 0) { found = fd; break; }
-            close(fd);
-        }
-        closedir(dir);
-        return found;
-    }
     // Classify the finished contact (gesture.h) and dispatch: a tap/long-press goes to the tap router
     // in main(), a swipe turns the page. Each path is independently debounced.
     void emitGesture(int dx, int dy, int x, int y, gint64 downUs) {
@@ -3708,6 +3921,60 @@ private:
     std::atomic<bool> m_stop { false };
     gint64 m_lastSwipeUs = 0;
     gint64 m_lastTapUs = 0;
+};
+
+// ---------------------------------------------------------------------------
+// PowerReader — the hardware power key (snvs-powerkey) and the folio-cover hall sensor, on their own
+// thread. With xochitl stopped nothing else handles them (logind has HandlePowerKey=ignore). The key
+// is EVIOCGRAB'd: xovi-tripletap reads the same node, and a triple press would otherwise restart
+// xochitl under us. A press while asleep takes the wake lock right here, before the queued signal
+// reaches the GUI: autosleep re-suspends ~0.6 s after a wakeup nobody holds on to. (A press during
+// a real suspend is seen by sleepUntilWake instead: the stock hook inhibits the key until 2 s in.)
+// ---------------------------------------------------------------------------
+class PowerReader : public QObject {
+    Q_OBJECT
+public:
+    void requestStop() { m_stop.store(true); }
+Q_SIGNALS:
+    void powerPressed();
+    void coverChanged(bool closed);
+public Q_SLOTS:
+    void run() {
+        blockSigterm(true);   // TERM belongs to the GUI thread
+        const int key = openInputByName("30370000.snvs:snvs-powerkey");
+        const int hall = openInputByName("Hall effect sensors");
+        if (key < 0) qWarning("[power] power key node not found — no power-button standby");
+        else if (ioctl(key, EVIOCGRAB, reinterpret_cast<void*>(1)) != 0)
+            qWarning("[power] EVIOCGRAB on the power key failed — tripletap still sees presses");
+        if (hall < 0) qWarning("[power] hall sensor node not found — no cover standby");
+        if (key < 0 && hall < 0) return;
+        qInfo("[power] listening (key=%d hall=%d)", key >= 0, hall >= 0);
+        struct pollfd pfd[2] = { { key, POLLIN, 0 }, { hall, POLLIN, 0 } };   // fd -1 is skipped by poll
+        struct input_event ev[16];
+        while (!m_stop.load()) {
+            if (poll(pfd, 2, 200) <= 0) continue;
+            for (int i = 0; i < 2; ++i) {
+                if (!(pfd[i].revents & POLLIN)) continue;
+                const ssize_t n = read(pfd[i].fd, ev, sizeof ev);
+                for (ssize_t j = 0; j < n / ssize_t(sizeof(struct input_event)); ++j) {
+                    const struct input_event &e = ev[j];
+                    if (e.type == EV_KEY && e.code == KEY_POWER && e.value == 1) {
+                        if (g_asleep.load()) setWakeLock(true);
+                        Q_EMIT powerPressed();
+                    } else if (e.type == EV_SW && (e.code == SW_LID || e.code == SW_MACHINE_COVER)) {
+                        qInfo("[power] cover switch %d -> %d", e.code, e.value);
+                        if (e.code != SW_LID) continue;   // logged only until a folio confirms its meaning
+                        if (!e.value && g_asleep.load()) setWakeLock(true);
+                        Q_EMIT coverChanged(e.value != 0);
+                    }
+                }
+            }
+        }
+        if (key >= 0) { ioctl(key, EVIOCGRAB, reinterpret_cast<void*>(0)); close(key); }
+        if (hall >= 0) close(hall);
+    }
+private:
+    std::atomic<bool> m_stop { false };
 };
 
 #include "main.moc"
@@ -3951,6 +4218,8 @@ int main(int argc, char **argv) {
 
     QThread touchThread;
     TouchReader touchReader;
+    QThread powerThread;
+    PowerReader powerReader;
 
     if (!savePath.isEmpty()) {
         // --- save mode (headless proof): write the 2nd painted frame, then exit ---
@@ -4049,6 +4318,8 @@ int main(int argc, char **argv) {
                          Qt::QueuedConnection);            // same path as bwFastChanged
         QObject::connect(&engine, &WpeEngine::settleFlashChanged, view, &WpeView::setSettleFlash,
                          Qt::QueuedConnection);            // same path again
+        QObject::connect(&engine, &WpeEngine::sleepPageChanged, view, &WpeView::setSleepPage,
+                         Qt::QueuedConnection);
         QObject::connect(&engine, &WpeEngine::urlChanged, view,   // a new page resets the bar until
                          [view]{ view->setReadProgress(-1); });   // the first scroll/restore answers
         QObject::connect(&engine, &WpeEngine::renderingChanged, view,
@@ -4109,7 +4380,7 @@ int main(int argc, char **argv) {
             // GUI loop (the 12 s watchdog, and every present). It posts each decision to the GUI,
             // which owns the streak logic; a changed decision is logged with its vector.
             auto onSample = [view, restartApp, cand = -1, streak = 0](int o) mutable {
-                if (view->isExiting()) return;
+                if (view->isExiting() || view->inStandby()) { cand = -1; streak = 0; return; }
                 if (o < 0 || o == kRotate) { cand = -1; streak = 0; return; }
                 if (o != cand) { cand = o; streak = 1; return; }
                 if (++streak < 3 || view->isEditing()) return;
@@ -4172,6 +4443,7 @@ int main(int argc, char **argv) {
         touchReader.moveToThread(&touchThread);
         QObject::connect(&touchThread, &QThread::started, &touchReader, &TouchReader::run);
         QObject::connect(&touchReader, &TouchReader::swipe, &app, [&engine, view](int dir) {
+            if (view->inStandby()) return;   // only the power key (or the cover) wakes the tablet
             view->forceNextContent();   // page-turn frame must paint immediately (bypass SPA throttle)
             if (dir > 0) engine.pageNext(); else engine.pagePrev();
         });
@@ -4181,7 +4453,7 @@ int main(int argc, char **argv) {
         // pages at the edges. tap(x,y) is in panel px.
         QObject::connect(&touchReader, &TouchReader::tap, win ? win : qobject_cast<QObject*>(&app),
             [&engine, view](int x, int y) {
-                if (view->isExiting()) return;   // mid-drain (waveform/exit): no taps, no power-confirm
+                if (view->isExiting() || view->inStandby()) return;   // mid-drain / asleep: no taps
                 if (view->isEditing()) { view->handleEditTap(x, y); return; }   // keyboard captures all taps
                 const WpeView::Hit ch = view->hitChrome(x, y);
                 // Disabled buttons: no press flash — a toast says why instead of a silent no-op.
@@ -4253,10 +4525,68 @@ int main(int argc, char **argv) {
         // Long-press on the CHROME is not a content peek — hit-test first (same as the tap path).
         QObject::connect(&touchReader, &TouchReader::longPress, win ? win : qobject_cast<QObject*>(&app),
             [&engine, view](int x, int y){
-                if (view->hitChrome(x, y) != WpeView::None) return;
+                if (view->inStandby() || view->hitChrome(x, y) != WpeView::None) return;
                 engine.peekLink(x, y);
             }, Qt::QueuedConnection);
         touchThread.start();
+
+        // Standby: the power key toggles it, closing the folio cover enters it (opening wakes), and
+        // RMWEB_IDLE_SLEEP_MIN minutes without a touch enter it (default 15, 0 = never). The wake
+        // lock is ours from launch; readyToSleep drops it once the sleep screen is on the panel.
+        setWakeLock(true);
+        auto *idle = new QTimer(&app);
+        idle->setSingleShot(true);
+        {
+            const int min = qEnvironmentVariableIsSet("RMWEB_IDLE_SLEEP_MIN")
+                                ? qEnvironmentVariableIntValue("RMWEB_IDLE_SLEEP_MIN") : 15;
+            if (min > 0) idle->setInterval(min * 60 * 1000);
+            qInfo("[standby] wake lock held; idle sleep %s", min > 0 ? qPrintable(QString::number(min) + " min") : "off");
+            QObject::connect(idle, &QTimer::timeout, view, [view]{ view->enterStandby("idle"); });
+            auto poke = [idle, min]{ if (min > 0) idle->start(); };
+            poke();
+            for (auto sig : { &TouchReader::tap, &TouchReader::longPress })
+                QObject::connect(&touchReader, sig, idle, [poke](int, int){ poke(); }, Qt::QueuedConnection);
+            QObject::connect(&touchReader, &TouchReader::swipe, idle, [poke](int){ poke(); }, Qt::QueuedConnection);
+            static gint64 lastWakeUs = 0;
+            auto wake = [view, poke](const char *why) {
+                g_sleepGen.fetch_add(1);   // cancels a suspend loop still waiting on the panel rails
+                g_asleep.store(false);
+                setWakeLock(true);   // PowerReader may already hold it; idempotent
+                writeSysfs("/sys/power/autosleep", "mem");   // sleepUntilWake turned it off
+                lastWakeUs = g_get_monotonic_time();
+                view->exitStandby(why);
+                poke();
+            };
+            QObject::connect(view, &WpeView::readyToSleep, &app, [&app, idle, wake]{
+                idle->stop();
+                g_asleep.store(true);
+                const int gen = g_sleepGen.load();
+                std::thread([&app, wake, gen]{
+                    const char *why = sleepUntilWake(gen);
+                    if (why) QMetaObject::invokeMethod(&app, [wake, why]{ wake(why); }, Qt::QueuedConnection);
+                }).detach();
+            });
+            QObject::connect(&powerReader, &PowerReader::powerPressed, view,
+                             [view, wake, idle, last = gint64(0)]() mutable {
+                const gint64 now = g_get_monotonic_time();
+                if (last && now - last < 800000) return;   // key bounce / impatient double press
+                last = now;
+                // The press that woke the tablet can still arrive after resume (the stock hook
+                // un-inhibits the key 2 s in): it must not put the tablet straight back to sleep.
+                if (lastWakeUs && now - lastWakeUs < 3000000) return;
+                if (view->isExiting()) return;
+                if (view->inStandby()) wake("power key");
+                else { idle->stop(); view->enterStandby("power key"); }
+            }, Qt::QueuedConnection);
+            QObject::connect(&powerReader, &PowerReader::coverChanged, view, [view, wake, idle](bool closed) {
+                if (view->isExiting()) return;
+                if (closed) { idle->stop(); view->enterStandby("cover closed"); }
+                else if (view->inStandby()) wake("cover opened");
+            }, Qt::QueuedConnection);
+        }
+        powerReader.moveToThread(&powerThread);
+        QObject::connect(&powerThread, &QThread::started, &powerReader, &PowerReader::run);
+        powerThread.start();
 
         // SIGTERM clean exit: the handler only latches g_termRequested (async-signal-safe); this poll
         // runs the real path on the GUI thread, where it is allowed to wait on the panel. From here on
@@ -4403,6 +4733,18 @@ int main(int argc, char **argv) {
             });
         }
 
+        // DIAG (RMWEB_DEBUG_STANDBY="enterMs,wakeMs"): synthetic power-key presses — standby at
+        // enterMs, wake at wakeMs (0/absent = stay asleep). On USB the charger's wake lock keeps the
+        // kernel up, so this exercises the app side only: sleep screen, blocked presents, the wake repaint.
+        if (qEnvironmentVariableIsSet("RMWEB_DEBUG_STANDBY")) {
+            const QStringList f = qEnvironmentVariable("RMWEB_DEBUG_STANDBY").split(QLatin1Char(','));
+            const int enterMs = f.value(0).toInt(), wakeMs = f.value(1).toInt();
+            if (enterMs > 0) QTimer::singleShot(enterMs, &app, [&powerReader]{
+                qInfo("[standby][dbg] press (enter)"); Q_EMIT powerReader.powerPressed(); });
+            if (wakeMs > enterMs) QTimer::singleShot(wakeMs, &app, [&powerReader]{
+                qInfo("[standby][dbg] press (wake)"); Q_EMIT powerReader.powerPressed(); });
+        }
+
         // DIAG (RMWEB_DEBUG_ZOOM): bump page zoom +2 steps after N ms (verify the scaling with RMWEB_GRAB_MS).
         if (const int zMs = qEnvironmentVariableIntValue("RMWEB_DEBUG_ZOOM"); zMs > 0) {
             QTimer::singleShot(zMs, &app, [&engine]{ qInfo("[zoom][dbg] +2"); engine.zoomBy(1); engine.zoomBy(1); });
@@ -4430,6 +4772,9 @@ int main(int argc, char **argv) {
     touchReader.requestStop();
     touchThread.quit();
     touchThread.wait();
+    powerReader.requestStop();
+    powerThread.quit();
+    powerThread.wait();
     engine.stop();
     thread.quit();
     thread.wait();

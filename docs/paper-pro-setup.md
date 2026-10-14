@@ -69,6 +69,8 @@ What `all` does, in order:
   reMarkable's quick settings. Start page → Open settings → Display → *Screen orientation* cycles
   auto → portrait → landscape (right edge on top) → landscape flipped (left edge on top) to pin
   one instead.
+- **While the browser is open** the power button sleeps and wakes it, so triple-press does nothing
+  there. Quit the browser (⏻ in its toolbar) first.
 - **After a reboot** xovi is off (it's tethered by design). Triple-press the power button to bring
   AppLoad back.
 

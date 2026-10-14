@@ -47,6 +47,7 @@ use it at your own risk.
 | 🧭 **Toolbar stays still** | Page turns redraw only the page; the toolbar redraws only when it changes. |
 | 📖 **Made for reading** | Reader mode, bookmarks, history, in-page find, autofill and an ad and tracker blocker. |
 | 📄 **PDFs to your library** | Download a PDF or EPUB (an arXiv paper, say) and it lands in the reMarkable library. |
+| 😴 **Sleeps like the tablet** | Press the power button or close the folio to sleep, press again to wake on the same page. It also sleeps after 15 minutes untouched. |
 | 🔤 **Your fonts or theirs** | Turn web fonts off for one render with the tablet's darker built-in fonts. |
 | ⚡ **Builds in a minute** | `./scripts/fast-build.sh all` rebuilds the app against the release's prebuilt engine, no multi-hour WebKit compile. |
 

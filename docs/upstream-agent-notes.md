@@ -585,3 +585,18 @@ edit zone only, region presents always on while editing (content stays opt-in RM
 thread) — diag only, keep runs short. (3) makeUuidV4 seeded mt19937 with ONE 32-bit word -> 2^32 id
 space (flaky fuzz test + a real collision would overwrite a xochitl library document); bytes now
 come straight from random_device.
+**2026-10-14 (fork.9) — power / standby facts:** kernel autosleep is on (`remarkable-enable-slumber`
+writes `mem` to `/sys/power/autosleep` 30 s after boot); xochitl (libcslpower) keeps the tablet up
+with `/sys/power/wake_lock`. While rmweb ran on battery nothing held a lock: dmesg showed
+`PM: suspend entry (deep)` about once a second, woken by `mmc1` (Wi-Fi) and `elants_spi` (touch).
+logind has `HandlePowerKey=ignore`; the key is `30370000.snvs:snvs-powerkey` (event0), the folio
+is `Hall effect sensors` (event1, `SW_LID` + `SW_MACHINE_COVER`, both 0 with the cover open).
+`udev.charger` (43-charger.rules) holds a lock while USB-powered. `/sys/power/wakeup_count` blocks
+on read while wakeup events are in progress — don't `cat` it in scripts.
+`/sys/devices/platform/suspend-event/target_pid` is libcslpower's (stale xochitl pids), not ours.
+Panel power blocks suspend for ~30 s (2026-10-14): the EPD PMIC (`1-0048`, g2194-regulator, the
+cumulus-panel rails) is a wakeup source while its rails are on, and they stay on ~30 s after the last
+panel update (`vpdd_length` = 30000). So after standby releases `rmweb`, the kernel suspends only once
+that hold ends. A wake within ~30 s means the tablet never actually slept. Check
+`/sys/class/wakeup/*` (name `1-0048`, `active_time_ms`) and `/sys/power/suspend_stats/success`.
+

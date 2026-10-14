@@ -57,6 +57,11 @@ cleanup(){
   # Auto-rotation raises the accelerometer's sample rate (faster one-shot reads); hand xochitl back
   # the rate it had before we launched.
   [ -n "${ACC_FREQ:-}" ] && [ -n "${ACC_FREQ_FILE:-}" ] && echo "$ACC_FREQ" > "$ACC_FREQ_FILE" 2>/dev/null
+  # The app holds the kernel wake lock "rmweb" while awake (standby releases it). A crash or kill
+  # leaves it behind, and a leftover lock keeps the tablet from ever sleeping again.
+  [ -w /sys/power/wake_unlock ] && { echo rmweb > /sys/power/wake_unlock; } 2>/dev/null
+  # Standby turns kernel autosleep off around each suspend; a crash mid-standby must not leave it off.
+  [ "$(cat /sys/power/autosleep 2>/dev/null)" = off ] && { echo mem > /sys/power/autosleep; } 2>/dev/null
   # Release the lock ONLY if it's still ours (a takeover run replaced it with its own pid).
   [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ] && rm -rf "$LOCK"
 }

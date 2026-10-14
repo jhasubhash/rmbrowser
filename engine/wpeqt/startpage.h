@@ -46,6 +46,8 @@ namespace icon {
         "<path d='m19 5-1.256 1.256'/><path d='M20 12h2'/>";
     inline const char* contrast =   // half-filled disc; the path carries its own fill
         "<circle cx='12' cy='12' r='10'/><path fill='currentColor' stroke='none' d='M12 18a6 6 0 0 0 0-12v12z'/>";
+    inline const char* moon =   // lucide moon
+        "<path d='M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z'/>";
     inline const char* smartphone =
         "<rect width='14' height='20' x='5' y='2' rx='2' ry='2'/><path d='M12 18h.01'/>";
     inline const char* shield =
@@ -220,6 +222,10 @@ inline std::string buildSettingsPage(const Settings& s) {
     h += "<div class='hint'>Auto turns the page when you turn the tablet (about a second after you "
          "settle; not while typing or lying flat), unless rotation is locked in the reMarkable's quick "
          "settings. The browser restarts to rotate and reopens your page.</div>";
+    row(icon::moon, "rmweb:toggle-sleeppage", "Sleep screen", s.sleepPage ? "this page" : "reMarkable");
+    h += "<div class='hint'>What stays on the panel while the tablet sleeps (power button, closed "
+         "folio, or 15 minutes untouched): the page you were reading, or the reMarkable sleep "
+         "image.</div>";
     h += "<h2>Reading</h2>";
     row(icon::sunMoon, "rmweb:toggle-dark", "Reader theme", s.readerDark ? "dark" : "light");
     h += "<div class='hint'>Font size: the A- / A+ buttons while reading.</div>";

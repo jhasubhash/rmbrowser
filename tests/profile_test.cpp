@@ -216,6 +216,10 @@ int main() {
     CHECK(sb3.block); CHECK(sb3.siteCss); CHECK(!sb3.bwFast);     // absent keys -> defaults
     CHECK(sb3.textBoost);                                         // textBoost defaults ON
     CHECK(sb3.settleFlash);                                       // settleFlash defaults ON
+    CHECK(sb3.sleepPage);                                         // sleepPage defaults ON
+    Settings ss; ss.sleepPage = false;
+    CHECK(saveSettings(dir, ss));
+    CHECK(!loadSettings(dir).sleepPage);                          // sleepPage round-trips
     CHECK(sb3.autoRefreshSec == 15);
 
     // loadSettings snaps autoRefreshSec to the fixed valid set {-1,0,15,30,60} (the settings page

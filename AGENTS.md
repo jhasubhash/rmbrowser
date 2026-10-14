@@ -116,7 +116,9 @@ at the panel.
 - **Never stop xochitl while it's still starting.** Verified 2026-10-13: launching rmweb 13 s after
   xochitl (re)started made xochitl SEGV on stop, and `OnFailure` triggered an emergency reboot.
   Before each test launch, poll until `systemctl is-active xochitl` and the xochitl process is
-  ≥ 15 s old (`/proc/<pid>/stat` field 22 vs `/proc/uptime`). Don't use a fixed sleep.
+  ≥ 30 s old (`/proc/<pid>/stat` field 22 vs `/proc/uptime`). Don't use a fixed sleep.
+  15 s was not enough (2026-10-14): a launch 16 s after a restart, with xochitl still loading
+  xovi integrations, left it failing to restart, and the emergency target rebooted the tablet.
 - **Frame dup test = exact row diff** (fixed 2026-10-13, fork.4). Upstream decided "new frame?"
   from a sparse fingerprint (1 pixel per 40×40 cell), which dropped small changes. Settings-page
   toggles flipped the value but never redrew it: the reloaded page hashed identical. The engine
@@ -165,6 +167,28 @@ at the panel.
   scope.
 - **`qEnvironmentVariableIntValue` returns 0 when unset.** Check `qEnvironmentVariableIsSet` first.
 - **Don't pass JS containing `%` through `g_strdup_printf`** (double it as `%%`).
+- **Standby suspends like xochitl** (fork.9–12, 2026-10-14). The stock OS runs kernel autosleep
+  (`/sys/power/autosleep = mem`) and xochitl holds a wake lock while awake. With xochitl stopped and
+  no lock, the tablet suspended about once a second on battery mid-browsing (dmesg). The app now
+  holds `rmweb` in `/sys/power/wake_lock` from launch; `device/rmweb` releases it on exit.
+  - Power key (`30370000.snvs:snvs-powerkey`, EVIOCGRAB'd so xovi-tripletap can't restart xochitl
+    under us), the folio `SW_LID` (hall sensor) or `RMWEB_IDLE_SLEEP_MIN` (default 15, 0 = off)
+    enter standby: sleep screen (the page + a note, or `suspended.png` per the Sleep screen
+    setting) → one full develop → `sleepUntilWake` on its own thread.
+  - `sleepUntilWake` waits for the EPD PMIC (`1-0048`) to drop its rails (~30 s after the last
+    panel update), turns autosleep off, releases the lock and runs `systemctl suspend`, so the
+    stock `/usr/lib/systemd/system-sleep` hooks take Wi-Fi/BT down and limit wake sources to
+    `/etc/pm/sleep.wakesrc`. Autosleep alone kept waking on Wi-Fi IRQs.
+  - `systemctl suspend` returns before the suspend: the resume is detected by
+    `/sys/power/suspend_stats/success`. The wake reason is `/sys/power/pm_wakeup_irq` (power key
+    = IRQ 20, `Folio sensor` = 96); the powerkey wakeup source never counts events. Anything else
+    goes back to sleep after 10 s (the resume hook's 8 s `sleep.resume` lock aborts a sooner try).
+  - The first attempt after awake time aborts ("tasks refusing to freeze": a wakeup event still
+    pending); `suspend_stats/fail` shows it and the loop retries after 2 s, which then sleeps.
+  - dmesg timestamps stop during suspend, so every wake looks ~0.1 s after "suspend entry".
+    Use `/proc/uptime` or the journal's wall clock for sleep lengths.
+  - `RMWEB_DEBUG_STANDBY="enterMs,wakeMs"` fakes the key presses (app side only). An RTC alarm
+    (`echo +45 > /sys/class/rtc/rtc0/wakealarm`) wakes a test suspend with nobody at the tablet.
 - **Restart xochitl only via `/home/root/xovi/start`.** A bare `systemctl restart xochitl` drops
   xovi's tmpfs drop-in.
 
@@ -207,7 +231,11 @@ at the panel.
      stationary tablet, with no recorded vector. The thread + 50 Hz path hasn't reproduced them.
      `[rotate] sensor (x, y, z) -> o` lines log every decision change.
    - Next: rotate live without restarting (resize the viewport, rebuild keyboard/zones).
-3. Merge upstream releases: `git fetch upstream && git merge upstream/master`.
+3. 🔄 **Standby** (0.9.7-fork.12): power key / folio cover / idle timeout → sleep screen → real
+   suspend; see the gotcha above. Device-verified 2026-10-14: suspend with Wi-Fi off, power-key
+   wake back to the page; an RTC-alarm suspend confirmed nothing else wakes it. Open: folio
+   untested, suspend-then-hibernate (xochitl's 4 h hibernate) not used.
+4. Merge upstream releases: `git fetch upstream && git merge upstream/master`.
 
 ## Working agreement
 
